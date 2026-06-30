@@ -10,6 +10,7 @@ public class PaintParticleEmitter : MonoBehaviour
         public Vector3 velocity;
         public float age;
         public bool deposited;
+        public int streamId;
     }
 
     [Header("References")]
@@ -34,6 +35,13 @@ public class PaintParticleEmitter : MonoBehaviour
     public float gravity = 9.81f;
     public bool isPaused = true;
 
+    [Header("Trail Test Mode")]
+    public bool deterministicTrailTestMode = false;
+    public float testPathWidth = 4f;
+    public float testPathDepth = 1.4f;
+    public float testPathHeight = 3f;
+    public float testPathSpeed = 1.1f;
+
     [Header("Visual")]
     public float particleVisualScale = 0.035f;
     public Material particleMaterial;
@@ -47,6 +55,10 @@ public class PaintParticleEmitter : MonoBehaviour
     private PaintParticle[] particles;
     private float emissionAccumulator;
     private Vector3 previousExitPosition;
+    private Vector3 testExitPosition;
+    private Vector3 previousTestExitPosition;
+    private int streamBaseId;
+    private const int StreamLaneCount = 16;
     private Mesh particleMesh;
     private Material runtimeParticleMaterial;
     private readonly Matrix4x4[] drawMatrices = new Matrix4x4[1023];
@@ -70,6 +82,9 @@ public class PaintParticleEmitter : MonoBehaviour
         {
             previousExitPosition = exitPoint.position;
         }
+
+        previousTestExitPosition = GetDeterministicTestExitPosition(0f);
+        testExitPosition = previousTestExitPosition;
 
         if (particleMesh == null)
         {
@@ -104,6 +119,7 @@ public class PaintParticleEmitter : MonoBehaviour
 
         if (runtimeParticleMaterial != null)
         {
+            runtimeParticleMaterial.enableInstancing = true;
             runtimeParticleMaterial.color = paintColor;
         }
     }
@@ -135,6 +151,7 @@ public class PaintParticleEmitter : MonoBehaviour
 
         if (runtimeParticleMaterial != null)
         {
+            runtimeParticleMaterial.enableInstancing = true;
             runtimeParticleMaterial.color = paintColor;
         }
     }
@@ -158,6 +175,7 @@ public class PaintParticleEmitter : MonoBehaviour
         {
             particles[i].active = false;
             particles[i].deposited = false;
+            particles[i].streamId = 0;
         }
 
         if (resetPaintAmount)
@@ -175,6 +193,10 @@ public class PaintParticleEmitter : MonoBehaviour
         {
             previousExitPosition = exitPoint.position;
         }
+
+        previousTestExitPosition = GetDeterministicTestExitPosition(Time.unscaledTime);
+        testExitPosition = previousTestExitPosition;
+        streamBaseId += StreamLaneCount;
     }
 
     public void SetPaused(bool paused)
@@ -195,11 +217,18 @@ public class PaintParticleEmitter : MonoBehaviour
             return;
         }
 
+        Vector3 currentExitPosition = GetCurrentExitPosition();
         Vector3 exitVelocity = Vector3.zero;
-        if (exitPoint != null)
+        if (deterministicTrailTestMode)
         {
-            exitVelocity = (exitPoint.position - previousExitPosition) / dt;
-            previousExitPosition = exitPoint.position;
+            exitVelocity = (currentExitPosition - previousTestExitPosition) / dt;
+            previousTestExitPosition = currentExitPosition;
+            testExitPosition = currentExitPosition;
+        }
+        else if (exitPoint != null)
+        {
+            exitVelocity = (currentExitPosition - previousExitPosition) / dt;
+            previousExitPosition = currentExitPosition;
         }
 
         if (!isPaused)
@@ -214,7 +243,7 @@ public class PaintParticleEmitter : MonoBehaviour
     private void Emit(float dt, Vector3 exitVelocity)
     {
         CurrentFlowRateKgPerSecond = CalculateFlowRate(exitVelocity.magnitude);
-        if (exitPoint == null || remainingPaintAmount <= 0f || CurrentFlowRateKgPerSecond <= 0f)
+        if ((!deterministicTrailTestMode && exitPoint == null) || remainingPaintAmount <= 0f || CurrentFlowRateKgPerSecond <= 0f)
         {
             CurrentFlowRateKgPerSecond = 0f;
             return;
@@ -231,7 +260,7 @@ public class PaintParticleEmitter : MonoBehaviour
 
         for (int i = 0; i < emitCount; i++)
         {
-            SpawnParticle(exitVelocity);
+            SpawnParticle(exitVelocity, i);
         }
     }
 
@@ -249,7 +278,7 @@ public class PaintParticleEmitter : MonoBehaviour
         return area * 35f * Mathf.Max(0.1f, flowSpeed) * gravityFactor * viscosityFactor * paintHeadFactor * motionFactor * humidityFactor;
     }
 
-    private void SpawnParticle(Vector3 exitVelocity)
+    private void SpawnParticle(Vector3 exitVelocity, int emissionIndex)
     {
         int index = FindFreeParticleIndex();
         if (index < 0)
@@ -257,16 +286,22 @@ public class PaintParticleEmitter : MonoBehaviour
             return;
         }
 
-        Vector3 randomOffset = Random.insideUnitSphere * holeDiameter * 0.25f;
-        Vector3 downward = exitPoint.TransformDirection(Vector3.down);
-        Vector3 tangentJitter = Random.insideUnitSphere * holeDiameter * 2f;
+        bool ribbonMode = paintingSurface != null && paintingSurface.trailMode == PaintingSurface.TrailRenderMode.Ribbon;
+        float offsetScale = ribbonMode || deterministicTrailTestMode ? 0.12f : 0.25f;
+        float jitterScale = ribbonMode || deterministicTrailTestMode ? 0.45f : 2f;
+        Vector3 randomOffset = Random.insideUnitSphere * holeDiameter * offsetScale;
+        Vector3 downward = deterministicTrailTestMode || exitPoint == null ? Vector3.down : exitPoint.TransformDirection(Vector3.down);
+        Vector3 tangentJitter = Random.insideUnitSphere * holeDiameter * jitterScale;
+        Vector3 spawnPosition = GetCurrentExitPosition();
+        int lane = Mathf.Abs(EmittedParticleCount + emissionIndex) % StreamLaneCount;
 
         particles[index].active = true;
-        particles[index].position = exitPoint.position + randomOffset;
+        particles[index].position = spawnPosition + randomOffset;
         particles[index].previousPosition = particles[index].position;
         particles[index].velocity = downward.normalized * flowSpeed + exitVelocity * 0.8f + tangentJitter;
         particles[index].age = 0f;
         particles[index].deposited = false;
+        particles[index].streamId = streamBaseId + lane;
         EmittedParticleCount++;
     }
 
@@ -318,7 +353,10 @@ public class PaintParticleEmitter : MonoBehaviour
                     particle.velocity.magnitude,
                     viscosity,
                     holeDiameter,
-                    flowSpeed
+                    flowSpeed,
+                    gravity,
+                    particle.streamId,
+                    particle.velocity
                 );
             }
 
@@ -346,6 +384,8 @@ public class PaintParticleEmitter : MonoBehaviour
         {
             return;
         }
+
+        runtimeParticleMaterial.enableInstancing = true;
 
         int batchCount = 0;
         int activeCount = 0;
@@ -391,6 +431,38 @@ public class PaintParticleEmitter : MonoBehaviour
         airDrag = Mathf.Max(0f, airDrag);
         gravity = Mathf.Max(0f, gravity);
         humidity = Mathf.Clamp01(humidity);
+        testPathWidth = Mathf.Max(0.1f, testPathWidth);
+        testPathDepth = Mathf.Max(0.1f, testPathDepth);
+        testPathHeight = Mathf.Max(0.1f, testPathHeight);
+        testPathSpeed = Mathf.Max(0.01f, testPathSpeed);
+    }
+
+    private Vector3 GetCurrentExitPosition()
+    {
+        if (deterministicTrailTestMode)
+        {
+            return GetDeterministicTestExitPosition(Time.unscaledTime);
+        }
+
+        return exitPoint != null ? exitPoint.position : transform.position;
+    }
+
+    private Vector3 GetDeterministicTestExitPosition(float time)
+    {
+        Vector3 center = paintingSurface != null
+            ? paintingSurface.transform.TransformPoint(new Vector3(0f, testPathHeight, 0f))
+            : transform.position + Vector3.up * testPathHeight;
+
+        float phase = time * testPathSpeed;
+        Vector3 localPath = new Vector3(
+            Mathf.Sin(phase) * testPathWidth * 0.5f,
+            0f,
+            Mathf.Sin(phase * 0.5f + 0.7f) * testPathDepth * 0.5f
+        );
+
+        return paintingSurface != null
+            ? paintingSurface.transform.TransformPoint(new Vector3(localPath.x, testPathHeight, localPath.z))
+            : center + localPath;
     }
 
     private void OnDestroy()

@@ -2,6 +2,9 @@ using UnityEngine;
 
 public class ParticleDisplay3D : MonoBehaviour
 {
+    [Header("Presentation")]
+    public bool showParticles = false;
+
     public Shader shader;
     public float scale = 0.035f;
     public Color col = Color.blue;
@@ -62,6 +65,7 @@ public class ParticleDisplay3D : MonoBehaviour
         }
 
         mat = new Material(shader);
+        mat.enableInstancing = true;
 
         mat.SetBuffer("Positions", sim.positionBuffer);
         mat.SetBuffer("Velocities", sim.velocityBuffer);
@@ -80,7 +84,7 @@ public class ParticleDisplay3D : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (!initialized || mat == null || mesh == null || argsBuffer == null)
+        if (!showParticles || !initialized || mat == null || mesh == null || argsBuffer == null)
         {
             return;
         }

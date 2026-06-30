@@ -27,6 +27,7 @@ public class Simulation3D : MonoBehaviour
     public float viscosityStrength;
 
     [Header("Particle Count Presets")]
+    public bool showLegacyFluidParticles = false;
     public ParticleCountPreset particlePreset = ParticleCountPreset.Low;
     public int currentParticleCount = 8000;
     public float estimatedGpuBufferMegabytes;
@@ -89,6 +90,7 @@ public class Simulation3D : MonoBehaviour
             return;
         }
 
+        ApplyLegacyParticleVisibility();
         ApplyParticlePreset(particlePreset);
     }
 
@@ -107,6 +109,7 @@ public class Simulation3D : MonoBehaviour
         holeDiameter = Mathf.Max(0.001f, holeDiameter);
         currentParticleCount = GetParticleCount(particlePreset);
         estimatedGpuBufferMegabytes = EstimateBufferMegabytes(currentParticleCount);
+        ApplyLegacyParticleVisibility();
     }
 
     void FixedUpdate()
@@ -138,6 +141,8 @@ public class Simulation3D : MonoBehaviour
             float safeYScale = Mathf.Max(0.001f, Mathf.Abs(transform.localScale.y));
             floorDisplay.transform.localScale = new Vector3(1, 1 / safeYScale * 0.1f, 1);
         }
+
+        ApplyLegacyParticleVisibility();
     }
 
     void RunSimulationFrame(float frameTime)
@@ -240,6 +245,7 @@ public class Simulation3D : MonoBehaviour
         if (recreatedBuffers && display != null)
         {
             display.Init(this);
+            ApplyLegacyParticleVisibility();
         }
     }
 
@@ -330,6 +336,7 @@ public class Simulation3D : MonoBehaviour
         if (display != null)
         {
             display.Init(this);
+            ApplyLegacyParticleVisibility();
         }
 
         initialized = true;
@@ -363,6 +370,21 @@ public class Simulation3D : MonoBehaviour
     {
         isPaused = paused;
         pauseNextFrame = false;
+    }
+
+    public void SetLegacyFluidParticlesVisible(bool visible)
+    {
+        showLegacyFluidParticles = visible;
+        ApplyLegacyParticleVisibility();
+    }
+
+    void ApplyLegacyParticleVisibility()
+    {
+        if (display != null)
+        {
+            display.showParticles = showLegacyFluidParticles;
+            display.enabled = showLegacyFluidParticles;
+        }
     }
 
     void ApplyPaintSpawnerSettings()

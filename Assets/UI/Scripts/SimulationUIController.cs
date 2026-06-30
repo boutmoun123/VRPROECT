@@ -74,13 +74,14 @@ public class SimulationUIController : MonoBehaviour
     public float simulationDurationLimit = 30f;
     public float canvasWidth = 10f;
     public float canvasHeight = 10f;
-    public float canvasTiltDegrees = 0f;
+    public float canvasTiltDegrees = 28f;
     public Color paintColor = new Color(0.1f, 0.25f, 1f, 1f);
 
     [Header("Unified Canvas UI")]
     public bool buildUnifiedCanvasUI = true;
     public bool disableLegacyUIVisuals = true;
     public bool enableDebugOnGUI = false;
+    public bool showLegacyFluidParticles = false;
 
     private float simulationTime;
     private bool isPaused = true;
@@ -111,6 +112,11 @@ public class SimulationUIController : MonoBehaviour
     private TMP_Text canvasStatusText;
     private TMP_Dropdown surfaceTypeDropdown;
     private TMP_Dropdown canvasOrientationDropdown;
+    private TMP_Dropdown trailModeDropdown;
+    private Slider canvasTiltSlider;
+    private ScrollRect tabContentScrollRect;
+    private Scrollbar tabContentScrollbar;
+    private bool canvasTilted;
     private readonly List<TMP_Text> dynamicValueTexts = new List<TMP_Text>();
     private RectTransform tabContentRoot;
     private readonly List<Button> tabButtons = new List<Button>();
@@ -261,7 +267,8 @@ public class SimulationUIController : MonoBehaviour
             canvasHeight = paintingSurface.currentHeight > 0.001f
                 ? paintingSurface.currentHeight
                 : paintingSurface.localHalfExtents.y * 2f * paintingSurface.transform.localScale.z;
-            canvasTiltDegrees = paintingSurface.orientation == "Tilted" ? paintingSurface.tiltAngle : 0f;
+            canvasTiltDegrees = paintingSurface.tiltAngle > 0.1f ? paintingSurface.tiltAngle : 28f;
+            canvasTilted = paintingSurface.orientation == "Tilted";
 
             for (int i = 0; i < surfaceTypes.Length; i++)
             {
@@ -502,11 +509,20 @@ public class SimulationUIController : MonoBehaviour
         {
             paintingSurface.paintColor = paintColor;
             string selectedSurface = surfaceTypes[Mathf.Clamp(surfaceTypeIndex, 0, surfaceTypes.Length - 1)];
-            string selectedOrientation = Mathf.Abs(canvasTiltDegrees) > 1f ? "Tilted" : "Horizontal";
-            paintingSurface.ApplyCanvasSettings(canvasWidth, canvasHeight, selectedSurface, selectedOrientation);
+            if (canvasOrientationDropdown != null)
+            {
+                canvasTilted = canvasOrientationDropdown.value == 1;
+            }
+
+            string selectedOrientation = canvasTilted ? "Tilted" : "Horizontal";
+            float appliedTilt = selectedOrientation == "Tilted" ? canvasTiltDegrees : 0f;
+            paintingSurface.ApplyCanvasSettings(canvasWidth, canvasHeight, selectedSurface, selectedOrientation, appliedTilt);
             canvasWidth = paintingSurface.currentWidth;
             canvasHeight = paintingSurface.currentHeight;
-            canvasTiltDegrees = paintingSurface.orientation == "Tilted" ? paintingSurface.tiltAngle : 0f;
+            if (canvasOrientationDropdown != null)
+            {
+                canvasOrientationDropdown.SetValueWithoutNotify(paintingSurface.orientation == "Tilted" ? 1 : 0);
+            }
         }
 
         if (paintEmitter != null)
@@ -726,6 +742,7 @@ public class SimulationUIController : MonoBehaviour
         if (fluidSimulation != null)
         {
             fluidSimulation.SetPaused(paused);
+            fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
         }
     }
 
@@ -774,6 +791,11 @@ public class SimulationUIController : MonoBehaviour
         if (paintingSurface != null)
         {
             paintingSurface.Initialize();
+        }
+
+        if (fluidSimulation != null)
+        {
+            fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
         }
 
         if (paintEmitter == null)
@@ -927,7 +949,33 @@ public class SimulationUIController : MonoBehaviour
         CreateTabButton(tabBar, "Results", DashboardTab.Results);
         CreateTabButton(tabBar, "Performance", DashboardTab.Performance);
 
-        tabContentRoot = CreatePanel("Active Tab Content", root, new Vector2(0.5f, 0f), new Vector2(0.5f, 1f), new Vector2(-600f, 190f), new Vector2(600f, -154f));
+        RectTransform tabPanel = CreatePanel("Active Tab Content", root, new Vector2(0.5f, 0f), new Vector2(0.5f, 1f), new Vector2(-600f, 190f), new Vector2(600f, -154f));
+        tabContentScrollRect = tabPanel.gameObject.AddComponent<ScrollRect>();
+        tabContentScrollRect.horizontal = false;
+        tabContentScrollRect.vertical = true;
+        tabContentScrollRect.movementType = ScrollRect.MovementType.Clamped;
+        tabContentScrollRect.scrollSensitivity = 32f;
+
+        RectTransform viewport = CreateUIObject("Tab Content Viewport", tabPanel);
+        viewport.anchorMin = Vector2.zero;
+        viewport.anchorMax = Vector2.one;
+        viewport.offsetMin = new Vector2(0f, 0f);
+        viewport.offsetMax = new Vector2(-24f, 0f);
+        viewport.gameObject.AddComponent<RectMask2D>();
+        tabContentScrollRect.viewport = viewport;
+
+        tabContentRoot = CreateUIObject("Tab Content", viewport);
+        tabContentRoot.anchorMin = new Vector2(0f, 1f);
+        tabContentRoot.anchorMax = new Vector2(1f, 1f);
+        tabContentRoot.pivot = new Vector2(0.5f, 1f);
+        tabContentRoot.offsetMin = Vector2.zero;
+        tabContentRoot.offsetMax = Vector2.zero;
+        tabContentScrollRect.content = tabContentRoot;
+
+        tabContentScrollbar = CreateVerticalScrollbar(tabPanel);
+        tabContentScrollRect.verticalScrollbar = tabContentScrollbar;
+        tabContentScrollRect.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.Permanent;
+        tabContentScrollRect.verticalScrollbarSpacing = 4f;
         RebuildActiveTab();
     }
 
@@ -967,6 +1015,41 @@ public class SimulationUIController : MonoBehaviour
         layout.childControlHeight = true;
         SetPreferredHeight(row, 44f);
         return row;
+    }
+
+    private Scrollbar CreateVerticalScrollbar(RectTransform parent)
+    {
+        RectTransform scrollbarRect = CreateUIObject("Tab Content Scrollbar", parent);
+        scrollbarRect.anchorMin = new Vector2(1f, 0f);
+        scrollbarRect.anchorMax = new Vector2(1f, 1f);
+        scrollbarRect.pivot = new Vector2(1f, 0.5f);
+        scrollbarRect.offsetMin = new Vector2(-18f, 8f);
+        scrollbarRect.offsetMax = new Vector2(-8f, -8f);
+
+        Image track = scrollbarRect.gameObject.AddComponent<Image>();
+        track.color = new Color(0.08f, 0.1f, 0.14f, 0.92f);
+
+        Scrollbar scrollbar = scrollbarRect.gameObject.AddComponent<Scrollbar>();
+        scrollbar.direction = Scrollbar.Direction.BottomToTop;
+
+        RectTransform handleArea = CreateUIObject("Sliding Area", scrollbarRect);
+        handleArea.anchorMin = Vector2.zero;
+        handleArea.anchorMax = Vector2.one;
+        handleArea.offsetMin = new Vector2(1f, 1f);
+        handleArea.offsetMax = new Vector2(-1f, -1f);
+
+        RectTransform handle = CreateUIObject("Handle", handleArea);
+        handle.anchorMin = Vector2.zero;
+        handle.anchorMax = Vector2.one;
+        handle.offsetMin = Vector2.zero;
+        handle.offsetMax = Vector2.zero;
+        Image handleImage = handle.gameObject.AddComponent<Image>();
+        handleImage.color = new Color(0.42f, 0.62f, 0.86f, 0.95f);
+
+        scrollbar.targetGraphic = handleImage;
+        scrollbar.handleRect = handle;
+        scrollbar.value = 1f;
+        return scrollbar;
     }
 
     private RectTransform CreateResultScrollArea(Transform parent, float height)
@@ -1044,11 +1127,20 @@ public class SimulationUIController : MonoBehaviour
             layout = tabContentRoot.gameObject.AddComponent<VerticalLayoutGroup>();
         }
 
-        layout.padding = new RectOffset(22, 22, 18, 18);
+        layout.padding = new RectOffset(22, 22, 18, 56);
         layout.spacing = 12;
         layout.childControlWidth = true;
         layout.childForceExpandWidth = true;
         layout.childForceExpandHeight = false;
+
+        ContentSizeFitter fitter = tabContentRoot.gameObject.GetComponent<ContentSizeFitter>();
+        if (fitter == null)
+        {
+            fitter = tabContentRoot.gameObject.AddComponent<ContentSizeFitter>();
+        }
+
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
 
         UpdateTabButtonStyles();
         CreateSection(tabContentRoot, activeTab.ToString());
@@ -1074,6 +1166,13 @@ public class SimulationUIController : MonoBehaviour
                 CreatePerformanceTab(tabContentRoot);
                 break;
         }
+
+        Canvas.ForceUpdateCanvases();
+        LayoutRebuilder.ForceRebuildLayoutImmediate(tabContentRoot);
+        if (tabContentScrollRect != null)
+        {
+            tabContentScrollRect.verticalNormalizedPosition = 1f;
+        }
     }
 
     private void CreateMotionTab(Transform parent)
@@ -1097,7 +1196,61 @@ public class SimulationUIController : MonoBehaviour
         exitSpeedSlider = CreateSliderRow(parent, "Exit Speed", 0f, 8f, exitSpeed, "0.00 m/s", ChangeExitSpeed, out exitSpeedValueText);
         emissionRateSlider = CreateSliderRow(parent, "Flow Multiplier", 1f, 360f, emissionRate, "0", ChangeEmissionRate, out emissionRateValueText);
         CreateColorButtons(parent);
+        CreateTrailControls(parent);
         CreateButton(parent, "Clear Canvas", ClearCanvas);
+    }
+
+    private void CreateTrailControls(Transform parent)
+    {
+        int trailModeIndex = paintingSurface != null ? (int)paintingSurface.trailMode : (int)PaintingSurface.TrailRenderMode.Ribbon;
+        trailModeDropdown = CreateDropdown(parent, "Trail Mode", new[] { "Dots", "Trails", "Ribbon" }, Mathf.Clamp(trailModeIndex, 0, 2), value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.trailMode = (PaintingSurface.TrailRenderMode)value;
+                paintingSurface.trailModeEnabled = paintingSurface.trailMode != PaintingSurface.TrailRenderMode.Dots;
+            }
+        });
+
+        CreateSliderRow(parent, "Stroke Radius", 0.005f, 0.12f, paintingSurface != null ? paintingSurface.strokeRadius : 0.03f, "0.000", value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.strokeRadius = value;
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Stroke Smoothness", 0f, 1f, paintingSurface != null ? paintingSurface.strokeSmoothing : 0.65f, "0.00", value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.strokeSmoothing = value;
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Connect Distance", 0.01f, 0.14f, paintingSurface != null ? paintingSurface.connectDistanceThreshold : 0.065f, "0.000", value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.connectDistanceThreshold = value;
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Max Time Gap", 0.04f, 0.18f, paintingSurface != null ? paintingSurface.maxStrokeTimeGap : 0.1f, "0.00 s", value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.maxStrokeTimeGap = value;
+            }
+        }, out _);
+
+        CreateDropdown(parent, "Trail Test", new[] { "Off", "Sine Test" }, paintEmitter != null && paintEmitter.deterministicTrailTestMode ? 1 : 0, value =>
+        {
+            if (paintEmitter != null)
+            {
+                paintEmitter.deterministicTrailTestMode = value == 1;
+            }
+        });
     }
 
     private void CreateEnvironmentTab(Transform parent)
@@ -1113,13 +1266,19 @@ public class SimulationUIController : MonoBehaviour
         CreateSliderRow(parent, "Canvas Width", 1f, 20f, canvasWidth, "0.0", value => { canvasWidth = value; ApplyExtendedSettings(false); }, out _);
         CreateSliderRow(parent, "Canvas Height", 1f, 20f, canvasHeight, "0.0", value => { canvasHeight = value; ApplyExtendedSettings(false); }, out _);
         surfaceTypeDropdown = CreateDropdown(parent, "Surface Type", surfaceTypes, surfaceTypeIndex, value => { surfaceTypeIndex = value; ApplyExtendedSettings(false); });
-        canvasOrientationDropdown = CreateDropdown(parent, "Canvas Orientation", new[] { "Horizontal", "Tilted" }, Mathf.Abs(canvasTiltDegrees) > 1f ? 1 : 0, value =>
+        canvasOrientationDropdown = CreateDropdown(parent, "Canvas Orientation", new[] { "Horizontal", "Tilted" }, canvasTilted ? 1 : 0, value =>
         {
-            canvasTiltDegrees = value == 0 ? 0f : GetCanvasTiltAngle();
+            canvasTilted = value == 1;
             ApplyExtendedSettings(false);
         });
+        canvasTiltSlider = CreateSliderRow(parent, "Tilt Angle", 0f, 60f, canvasTiltDegrees, "0 deg", value =>
+        {
+            canvasTiltDegrees = value;
+            ApplyExtendedSettings(false);
+        }, out _);
+        CreateButton(parent, "Test UV Mapping", DrawUvMappingTest);
         canvasStatusText = CreateText("CanvasStatus", parent, "", 19, FontStyles.Normal, TextAlignmentOptions.TopLeft);
-        SetPreferredHeight(canvasStatusText.rectTransform, 190f);
+        SetPreferredHeight(canvasStatusText.rectTransform, 560f);
         UpdateCanvasStatusText();
     }
 
@@ -1149,6 +1308,15 @@ public class SimulationUIController : MonoBehaviour
         CreateButton(presetRow, "Medium 50k", () => ApplyParticlePresetFromUI(Simulation3D.ParticleCountPreset.Medium));
         CreateButton(presetRow, "High 200k", () => ApplyParticlePresetFromUI(Simulation3D.ParticleCountPreset.High));
         CreateButton(presetRow, "Ultra 1M", () => ApplyParticlePresetFromUI(Simulation3D.ParticleCountPreset.Ultra));
+
+        CreateDropdown(parent, "Legacy GPU Particles", new[] { "Hidden", "Visible" }, showLegacyFluidParticles ? 1 : 0, value =>
+        {
+            showLegacyFluidParticles = value == 1;
+            if (fluidSimulation != null)
+            {
+                fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
+            }
+        });
 
         TMP_Text perfText = CreateText("PerformanceDebug", parent, "", 20, FontStyles.Bold, TextAlignmentOptions.TopLeft);
         SetPreferredHeight(perfText.rectTransform, 132f);
@@ -1228,7 +1396,8 @@ public class SimulationUIController : MonoBehaviour
         CreateSliderRow(content, "Canvas Width", 1f, 20f, canvasWidth, "0.0", value => { canvasWidth = value; ApplyExtendedSettings(false); }, out _);
         CreateSliderRow(content, "Canvas Height", 1f, 20f, canvasHeight, "0.0", value => { canvasHeight = value; ApplyExtendedSettings(false); }, out _);
         surfaceTypeDropdown = CreateDropdown(content, "Surface Type", surfaceTypes, surfaceTypeIndex, value => { surfaceTypeIndex = value; ApplyExtendedSettings(false); });
-        canvasOrientationDropdown = CreateDropdown(content, "Canvas Orientation", new[] { "Horizontal", "Tilted" }, Mathf.Abs(canvasTiltDegrees) > 1f ? 1 : 0, value => { canvasTiltDegrees = value == 0 ? 0f : 35f; ApplyExtendedSettings(false); });
+        canvasOrientationDropdown = CreateDropdown(content, "Canvas Orientation", new[] { "Horizontal", "Tilted" }, canvasTilted ? 1 : 0, value => { canvasTilted = value == 1; ApplyExtendedSettings(false); });
+        canvasTiltSlider = CreateSliderRow(content, "Tilt Angle", 0f, 60f, canvasTiltDegrees, "0 deg", value => { canvasTiltDegrees = value; ApplyExtendedSettings(false); }, out _);
         CreateButton(content, "Clear Canvas", ClearCanvas);
     }
 
@@ -1565,6 +1734,11 @@ public class SimulationUIController : MonoBehaviour
         return value.ToString(format);
     }
 
+    private string FormatVector3(Vector3 value)
+    {
+        return value.x.ToString("0.00") + ", " + value.y.ToString("0.00") + ", " + value.z.ToString("0.00");
+    }
+
     private void SetPreferredHeight(RectTransform rectTransform, float height)
     {
         LayoutElement layoutElement = rectTransform.gameObject.GetComponent<LayoutElement>();
@@ -1617,6 +1791,19 @@ public class SimulationUIController : MonoBehaviour
         paintingSurface.ClearPainting();
         userMessage = "Canvas cleared.";
         UpdateResultTexts();
+    }
+
+    private void DrawUvMappingTest()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        paintingSurface.DrawMappingTestPattern();
+        userMessage = "UV mapping test pattern drawn.";
+        UpdateCanvasStatusText();
     }
 
     private void SaveImageFromUI()
@@ -1699,8 +1886,10 @@ public class SimulationUIController : MonoBehaviour
 
         bool wasPaused = isPaused;
         SetFluidPaused(true);
+        fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
         fluidSimulation.ApplyParticlePreset(preset);
         fluidSimulation.ResetFluid();
+        fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
         SetFluidPaused(wasPaused);
         userMessage = "Particle preset: " + fluidSimulation.particlePreset;
         if (activeTab == DashboardTab.Performance)
@@ -1814,21 +2003,40 @@ public class SimulationUIController : MonoBehaviour
         Vector3 scale = paintingSurface.BoardScale;
         int airborne = paintEmitter != null ? paintEmitter.ActiveAirborneParticleCount : 0;
         int deposited = paintEmitter != null ? paintEmitter.DepositedParticleCount : 0;
+        PaintingSurface.SurfaceBehavior behavior = paintingSurface.CurrentSurfaceBehavior;
         canvasStatusText.text =
-            "Applied width: " + paintingSurface.currentWidth.ToString("0.0") +
-            "\nApplied height: " + paintingSurface.currentHeight.ToString("0.0") +
-            "\nApplied surface type: " + paintingSurface.surfaceType +
-            "\nApplied orientation: " + paintingSurface.orientation +
+            "Canvas Width: " + paintingSurface.currentWidth.ToString("0.0") +
+            "\nCanvas Height: " + paintingSurface.currentHeight.ToString("0.0") +
+            "\nSurface Type: " + paintingSurface.surfaceType +
+            "\nOrientation: " + paintingSurface.orientation +
+            "\nTilt Angle slider: " + canvasTiltDegrees.ToString("0") + " deg" +
+            "\nApplied Tilt Angle: " + paintingSurface.tiltAngle.ToString("0") + " deg" +
+            "\nAbsorption: " + behavior.absorption.ToString("0.00") +
+            "\nSpread Multiplier: " + behavior.spreadMultiplier.ToString("0.00") +
+            "\nFriction: " + behavior.friction.ToString("0.00") +
+            "\nWetness Retention: " + behavior.wetnessRetention.ToString("0.00") +
+            "\nFlow Down Slope: " + behavior.flowDownSlope.ToString("0.00") +
+            "\nLast impact speed: " + paintingSurface.LastImpactSpeed.ToString("0.00") + " m/s" +
+            "\nAirborne particles: " + airborne +
+            "\nDeposited particles: " + deposited +
+            "\nTrail mode: " + paintingSurface.trailMode +
+            "\nConnected strokes: " + paintingSurface.ConnectedStrokeCount +
+            "\nRejected connections: " + paintingSurface.RejectedConnectionCount +
+            "\nAverage stroke length: " + paintingSurface.AverageStrokeLength.ToString("0.0") + " px" +
+            "\nActive streams: " + paintingSurface.ActiveStreamCount +
+            "\nLast hit UV: " + paintingSurface.LastHitUv.x.ToString("0.000") + ", " + paintingSurface.LastHitUv.y.ToString("0.000") +
+            "\nCurrent hit UV: " + paintingSurface.CurrentHitUv.x.ToString("0.000") + ", " + paintingSurface.CurrentHitUv.y.ToString("0.000") +
+            "\nWorld hit: " + FormatVector3(paintingSurface.LastWorldHit) +
+            "\nLocal hit: " + FormatVector3(paintingSurface.LastLocalHit) +
+            "\nPixel hit: " + paintingSurface.LastPixelHit.x.ToString("0") + ", " + paintingSurface.LastPixelHit.y.ToString("0") +
+            "\nUV world check: " + FormatVector3(paintingSurface.LastUvToWorldCheck) +
+            "\nMapping error: " + paintingSurface.MappingErrorDistance.ToString("0.0000") + " m" +
+            "\nConnect distance: " + paintingSurface.connectDistanceThreshold.ToString("0.000") +
+            "\nPainted area: " + (paintingSurface.EstimatedPaintedArea01 * 100f).ToString("0.0") + "%" +
+            "\nAverage wetness: " + paintingSurface.AverageWetness.ToString("0.000") +
+            "\nSplat radius / viscosity effect: " + paintingSurface.LastAppliedSplatRadius.ToString("0.000") + " / " + paintingSurface.LastViscosityEffect.ToString("0.00") +
             "\nBoard rotation: " + rotation.x.ToString("0.0") + ", " + rotation.y.ToString("0.0") + ", " + rotation.z.ToString("0.0") +
-            "\nBoard scale: " + scale.x.ToString("0.00") + ", " + scale.y.ToString("0.00") + ", " + scale.z.ToString("0.00") +
-            "\nAirborne / deposited: " + airborne + " / " + deposited +
-            "\nPainted area / avg wetness: " + (paintingSurface.EstimatedPaintedArea01 * 100f).ToString("0.0") + "% / " + paintingSurface.AverageWetness.ToString("0.000") +
-            "\nSplat radius / viscosity effect: " + paintingSurface.LastAppliedSplatRadius.ToString("0.000") + " / " + paintingSurface.LastViscosityEffect.ToString("0.00");
-    }
-
-    private float GetCanvasTiltAngle()
-    {
-        return paintingSurface != null ? paintingSurface.tiltAngle : 28f;
+            "\nBoard scale: " + scale.x.ToString("0.00") + ", " + scale.y.ToString("0.00") + ", " + scale.z.ToString("0.00");
     }
 
     private bool IsHideUiPressedThisFrame()
@@ -1907,7 +2115,7 @@ public class SimulationUIController : MonoBehaviour
         DrawSlider("Duration Limit s", ref simulationDurationLimit, 0f, 180f);
         DrawSlider("Canvas Width", ref canvasWidth, 1f, 20f);
         DrawSlider("Canvas Height", ref canvasHeight, 1f, 20f);
-        DrawSlider("Canvas Tilt deg", ref canvasTiltDegrees, -75f, 75f);
+        DrawSlider("Canvas Tilt deg", ref canvasTiltDegrees, 0f, 60f);
 
         if (GUILayout.Button("Surface Type: " + surfaceTypes[Mathf.Clamp(surfaceTypeIndex, 0, surfaceTypes.Length - 1)]))
         {
