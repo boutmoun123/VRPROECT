@@ -49,8 +49,7 @@ Shader "Instanced/Particle3D" {
 
 				float speed = length(Velocities[instanceID]);
 				float speedT = saturate(speed / velocityMax);
-				float colT = speedT;
-				o.colour = ColourMap.SampleLevel(linear_clamp_sampler, float2(colT, 0.5), 0);
+				o.colour = colour * lerp(0.65, 1.15, speedT);
 		
 				return o;
 			}

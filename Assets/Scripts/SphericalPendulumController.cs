@@ -62,12 +62,26 @@ public class SphericalPendulumController : MonoBehaviour
     [Range(0f, 1f)]
     public float tiltAmount = 1.0f;
 
+    [Header("Bucket Attachment")]
+    public bool autoBucketVisualOffsetFromAttachPoint = true;
+    public Vector3 bucketVisualOffset = new Vector3(0f, -0.7f, 0f);
+    public float maxAllowedDistanceError = 0.03f;
+    public bool showBucketDebug;
+
     [Header("Debug - Motion")]
     public Vector3 attachPointVelocity;
+    public bool motionHeldByMouse;
+    public float actualPivotToAttachDistance;
+    public float pivotAttachDistanceError;
+    public Vector3 debugPivotPosition;
+    public Vector3 debugAttachPosition;
+    public Vector3 debugBucketPosition;
+    public Vector3 debugBucketVisualOffset;
 
     [Header("Debug - Physical Outputs")]
     public float totalMass;
     public float effectiveDamping;
+    public float massResponseScale = 1f;
     public float ropeTension;
     public float kineticEnergy;
     public float potentialEnergy;
@@ -78,8 +92,13 @@ public class SphericalPendulumController : MonoBehaviour
 
     private Vector4 state;
     private Vector3 origin;
-    private Vector3 attachLocalOffset;
     private Vector3 previousAttachPosition;
+    private LineRenderer pivotAttachDebugLine;
+    private LineRenderer attachBucketDebugLine;
+    private Transform pivotDebugMarker;
+    private Transform attachDebugMarker;
+    private Transform bucketDebugMarker;
+    private Material debugMaterial;
     private float time;
     private bool initialized;
 
@@ -89,6 +108,10 @@ public class SphericalPendulumController : MonoBehaviour
 
     public float InitialPaintMass => Mathf.Max(0.001f, initialPaintMass);
     public float PaintRemainingFraction => Mathf.Clamp01(paintMass / InitialPaintMass);
+    public float CurrentTheta => initialized ? state.z : theta;
+    public float CurrentPhi => initialized ? state.w : phi;
+    public float CurrentThetaDot => initialized ? state.x : thetaDot;
+    public float CurrentPhiDot => initialized ? state.y : phiDot;
 
     private void OnValidate()
     {
@@ -105,6 +128,8 @@ public class SphericalPendulumController : MonoBehaviour
         sloshingStiffness = Mathf.Max(0f, sloshingStiffness);
         sloshingDamping = Mathf.Max(0f, sloshingDamping);
         sloshingMotionCoupling = Mathf.Max(0f, sloshingMotionCoupling);
+        maxAllowedDistanceError = Mathf.Max(0.001f, maxAllowedDistanceError);
+        bucketVisualOffset = SafeVector(bucketVisualOffset, new Vector3(0f, -0.7f, 0f));
     }
 
     private void Start()
@@ -119,6 +144,8 @@ public class SphericalPendulumController : MonoBehaviour
         {
             PreviewInitialPoseInEditor();
         }
+
+        UpdateBucketDebug();
     }
 
     private void FixedUpdate()
@@ -131,6 +158,20 @@ public class SphericalPendulumController : MonoBehaviour
         if (!initialized)
         {
             InitializeSimulation();
+        }
+
+        if (motionHeldByMouse)
+        {
+            attachPointVelocity = Vector3.zero;
+            previousAttachPosition = ropeAttachPoint.position;
+            UpdateAttachmentDebugValues();
+            return;
+        }
+
+        if (!ValidateRuntimeGeometry())
+        {
+            ResetBucketToPivot();
+            return;
         }
 
         float dt = Time.fixedDeltaTime > 0f ? Time.fixedDeltaTime : deltaT;
@@ -149,6 +190,7 @@ public class SphericalPendulumController : MonoBehaviour
 
         UpdatePhysicalOutputs(state.z);
         MoveBucketByAttachPoint(attachPosition);
+        EnforceAttachmentConstraint();
     }
 
     private void InitializeSimulation()
@@ -165,10 +207,11 @@ public class SphericalPendulumController : MonoBehaviour
         }
 
         origin = pivotPoint.position;
-        attachLocalOffset = transform.InverseTransformPoint(ropeAttachPoint.position);
+        ResolveBucketVisualOffset();
         state = new Vector4(thetaDot, phiDot, theta, phi);
 
         totalMass = Mathf.Max(0.001f, bucketEmptyMass + paintMass);
+        UpdateMassResponseScale();
         UpdateEffectiveDamping();
 
         sloshThetaOffset = 0f;
@@ -178,6 +221,7 @@ public class SphericalPendulumController : MonoBehaviour
 
         Vector3 attachPosition = GetPendulumPosition(state.z, state.w);
         MoveBucketByAttachPoint(attachPosition);
+        EnforceAttachmentConstraint();
 
         previousAttachPosition = attachPosition;
         attachPointVelocity = Vector3.zero;
@@ -196,10 +240,11 @@ public class SphericalPendulumController : MonoBehaviour
         }
 
         origin = pivotPoint.position;
-        attachLocalOffset = transform.InverseTransformPoint(ropeAttachPoint.position);
+        ResolveBucketVisualOffset();
 
         Vector3 initialAttachPosition = GetPendulumPosition(theta, phi);
         MoveBucketByAttachPoint(initialAttachPosition);
+        EnforceAttachmentConstraint();
     }
 
     private void UpdateMass(float dt)
@@ -210,6 +255,7 @@ public class SphericalPendulumController : MonoBehaviour
         }
 
         totalMass = Mathf.Max(0.001f, bucketEmptyMass + paintMass);
+        UpdateMassResponseScale();
     }
 
     private void UpdateEffectiveDamping()
@@ -219,6 +265,12 @@ public class SphericalPendulumController : MonoBehaviour
         float pivotDamping = pivotFrictionCoefficient / (totalMass * safeLength * safeLength);
 
         effectiveDamping = damping + airDamping + pivotDamping;
+    }
+
+    private void UpdateMassResponseScale()
+    {
+        float normalizedMass = Mathf.InverseLerp(0.2f, 10f, bucketEmptyMass);
+        massResponseScale = Mathf.Lerp(1.18f, 0.78f, normalizedMass);
     }
 
     private void UpdatePaintSloshing(float dt)
@@ -279,13 +331,13 @@ public class SphericalPendulumController : MonoBehaviour
             : 0f;
 
         float thetaDDot =
-            (ph_d * ph_d) * Mathf.Cos(th) * Mathf.Sin(th)
-            - (gravity / safeLength) * Mathf.Sin(th)
+            ((ph_d * ph_d) * Mathf.Cos(th) * Mathf.Sin(th)
+            - (gravity / safeLength) * Mathf.Sin(th)) * massResponseScale
             - effectiveDamping * th_d
             + sloshThetaEffect;
 
         float phiDDot =
-            -2.0f * th_d * ph_d / tanTheta
+            (-2.0f * th_d * ph_d / tanTheta) * massResponseScale
             - effectiveDamping * ph_d
             + sloshPhiEffect;
 
@@ -328,6 +380,7 @@ public class SphericalPendulumController : MonoBehaviour
 
     private void MoveBucketByAttachPoint(Vector3 targetAttachPosition)
     {
+        targetAttachPosition = ClampAttachToRopeLength(targetAttachPosition);
         Vector3 ropeDirection = pivotPoint.position - targetAttachPosition;
 
         if (ropeDirection.sqrMagnitude < 0.000001f)
@@ -343,18 +396,353 @@ public class SphericalPendulumController : MonoBehaviour
             ? Quaternion.Slerp(Quaternion.identity, ropeRotation, tiltAmount)
             : Quaternion.identity;
 
-        Vector3 rotatedAttachOffset = targetRotation * attachLocalOffset;
-
-        transform.position = targetAttachPosition - rotatedAttachOffset;
         transform.rotation = targetRotation;
+        transform.position = targetAttachPosition + targetRotation * bucketVisualOffset;
+        ropeAttachPoint.position = targetAttachPosition;
+        UpdateAttachmentDebugValues();
+    }
+
+    private void ResolveBucketVisualOffset()
+    {
+        if (!autoBucketVisualOffsetFromAttachPoint || ropeAttachPoint == null)
+        {
+            bucketVisualOffset = SafeVector(bucketVisualOffset, new Vector3(0f, -0.7f, 0f));
+            return;
+        }
+
+        if (ropeAttachPoint.IsChildOf(transform))
+        {
+            bucketVisualOffset = -ropeAttachPoint.localPosition;
+            if (bucketVisualOffset.sqrMagnitude > 0.000001f)
+            {
+                return;
+            }
+        }
+
+        OpenBucketMesh bucketMesh = GetComponent<OpenBucketMesh>();
+        float halfHeight = bucketMesh != null ? Mathf.Max(0.05f, bucketMesh.height * 0.5f) : 0.7f;
+        bucketVisualOffset = Vector3.down * halfHeight;
+    }
+
+    private Vector3 ClampAttachToRopeLength(Vector3 attachPosition)
+    {
+        Vector3 pivot = pivotPoint != null ? pivotPoint.position : origin;
+        float safeLength = Mathf.Max(0.001f, ropeLength);
+        Vector3 direction = attachPosition - pivot;
+
+        if (!IsFinite(direction) || direction.sqrMagnitude < 0.000001f)
+        {
+            direction = GetInitialDirection(theta, phi);
+        }
+
+        return pivot + direction.normalized * safeLength;
+    }
+
+    public void EnforceAttachmentConstraint()
+    {
+        if (pivotPoint == null || ropeAttachPoint == null)
+        {
+            return;
+        }
+
+        if (ropeLength <= 0f || !float.IsFinite(ropeLength))
+        {
+            ropeLength = 4f;
+        }
+
+        Vector3 correctedAttach = ClampAttachToRopeLength(ropeAttachPoint.position);
+        float error = Mathf.Abs(Vector3.Distance(pivotPoint.position, ropeAttachPoint.position) - ropeLength);
+        if (error > maxAllowedDistanceError || !IsFinite(transform.position) || !IsFinite(ropeAttachPoint.position))
+        {
+            MoveBucketByAttachPoint(correctedAttach);
+        }
+        else
+        {
+            UpdateAttachmentDebugValues();
+        }
+    }
+
+    private bool ValidateRuntimeGeometry()
+    {
+        if (pivotPoint == null || ropeAttachPoint == null)
+        {
+            return false;
+        }
+
+        if (!IsFinite(pivotPoint.position) || !IsFinite(ropeAttachPoint.position) || !IsFinite(transform.position))
+        {
+            return false;
+        }
+
+        if (ropeLength <= 0f || !float.IsFinite(ropeLength))
+        {
+            return false;
+        }
+
+        float distance = Vector3.Distance(pivotPoint.position, ropeAttachPoint.position);
+        return float.IsFinite(distance) && distance < ropeLength * 4f + 10f;
+    }
+
+    public void ResetBucketToPivot()
+    {
+        if (pivotPoint == null || ropeAttachPoint == null)
+        {
+            return;
+        }
+
+        ropeLength = Mathf.Max(0.001f, float.IsFinite(ropeLength) ? ropeLength : 4f);
+        origin = pivotPoint.position;
+        ResolveBucketVisualOffset();
+        Vector3 attachPosition = origin + GetInitialDirection(theta, phi) * ropeLength;
+        state = new Vector4(0f, 0f, theta, phi);
+        thetaDot = 0f;
+        phiDot = 0f;
+        sloshThetaOffset = 0f;
+        sloshPhiOffset = 0f;
+        sloshThetaVelocity = 0f;
+        sloshPhiVelocity = 0f;
+        attachPointVelocity = Vector3.zero;
+        previousAttachPosition = attachPosition;
+        MoveBucketByAttachPoint(attachPosition);
+        UpdatePhysicalOutputs(theta);
+        initialized = true;
+    }
+
+    private static Vector3 GetInitialDirection(float th, float ph)
+    {
+        return new Vector3(
+            Mathf.Sin(th) * Mathf.Cos(ph),
+            -Mathf.Cos(th),
+            Mathf.Sin(th) * Mathf.Sin(ph)).normalized;
+    }
+
+    private void UpdateAttachmentDebugValues()
+    {
+        if (pivotPoint == null || ropeAttachPoint == null)
+        {
+            actualPivotToAttachDistance = 0f;
+            pivotAttachDistanceError = 0f;
+            return;
+        }
+
+        debugPivotPosition = pivotPoint.position;
+        debugAttachPosition = ropeAttachPoint.position;
+        debugBucketPosition = transform.position;
+        debugBucketVisualOffset = transform.rotation * bucketVisualOffset;
+        actualPivotToAttachDistance = Vector3.Distance(debugPivotPosition, debugAttachPosition);
+        pivotAttachDistanceError = actualPivotToAttachDistance - Mathf.Max(0.001f, ropeLength);
+    }
+
+    private void UpdateBucketDebug()
+    {
+        bool visible = showBucketDebug && pivotPoint != null && ropeAttachPoint != null;
+        if (!visible)
+        {
+            SetDebugObjectVisible(pivotDebugMarker, false);
+            SetDebugObjectVisible(attachDebugMarker, false);
+            SetDebugObjectVisible(bucketDebugMarker, false);
+            SetDebugLineVisible(pivotAttachDebugLine, false);
+            SetDebugLineVisible(attachBucketDebugLine, false);
+            return;
+        }
+
+        EnsureBucketDebugObjects();
+        SetDebugObjectVisible(pivotDebugMarker, visible);
+        SetDebugObjectVisible(attachDebugMarker, visible);
+        SetDebugObjectVisible(bucketDebugMarker, visible);
+        SetDebugLineVisible(pivotAttachDebugLine, visible);
+        SetDebugLineVisible(attachBucketDebugLine, visible);
+
+        UpdateAttachmentDebugValues();
+        pivotDebugMarker.position = debugPivotPosition;
+        attachDebugMarker.position = debugAttachPosition;
+        bucketDebugMarker.position = debugBucketPosition;
+        pivotAttachDebugLine.SetPosition(0, debugPivotPosition);
+        pivotAttachDebugLine.SetPosition(1, debugAttachPosition);
+        attachBucketDebugLine.SetPosition(0, debugAttachPosition);
+        attachBucketDebugLine.SetPosition(1, debugBucketPosition);
+    }
+
+    private void EnsureBucketDebugObjects()
+    {
+        if (debugMaterial == null)
+        {
+            Shader shader = Shader.Find("Sprites/Default");
+            debugMaterial = new Material(shader);
+            debugMaterial.name = "Bucket Attachment Debug Material";
+        }
+
+        pivotDebugMarker = EnsureDebugMarker(pivotDebugMarker, "Bucket Debug Pivot Marker", Color.yellow);
+        attachDebugMarker = EnsureDebugMarker(attachDebugMarker, "Bucket Debug Attach Marker", Color.cyan);
+        bucketDebugMarker = EnsureDebugMarker(bucketDebugMarker, "Bucket Debug Center Marker", Color.magenta);
+        pivotAttachDebugLine = EnsureDebugLine(pivotAttachDebugLine, "Bucket Debug Pivot To Attach", Color.yellow);
+        attachBucketDebugLine = EnsureDebugLine(attachBucketDebugLine, "Bucket Debug Attach To Center", Color.cyan);
+    }
+
+    private Transform EnsureDebugMarker(Transform marker, string markerName, Color color)
+    {
+        if (marker != null)
+        {
+            return marker;
+        }
+
+        GameObject markerObject = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        markerObject.name = markerName;
+        markerObject.transform.SetParent(null);
+        markerObject.transform.localScale = Vector3.one * 0.11f;
+        DestroyRuntime(markerObject.GetComponent<Collider>());
+        MeshRenderer renderer = markerObject.GetComponent<MeshRenderer>();
+        if (renderer != null)
+        {
+            Material material = new Material(debugMaterial);
+            material.color = color;
+            renderer.sharedMaterial = material;
+        }
+        markerObject.SetActive(false);
+        return markerObject.transform;
+    }
+
+    private LineRenderer EnsureDebugLine(LineRenderer line, string lineName, Color color)
+    {
+        if (line != null)
+        {
+            return line;
+        }
+
+        GameObject lineObject = new GameObject(lineName);
+        lineObject.transform.SetParent(null);
+        line = lineObject.AddComponent<LineRenderer>();
+        line.useWorldSpace = true;
+        line.positionCount = 2;
+        line.startWidth = 0.025f;
+        line.endWidth = 0.025f;
+        line.sharedMaterial = debugMaterial;
+        line.startColor = color;
+        line.endColor = color;
+        line.enabled = false;
+        return line;
+    }
+
+    private static void SetDebugObjectVisible(Transform marker, bool visible)
+    {
+        if (marker != null && marker.gameObject.activeSelf != visible)
+        {
+            marker.gameObject.SetActive(visible);
+        }
+    }
+
+    private static void SetDebugLineVisible(LineRenderer line, bool visible)
+    {
+        if (line != null)
+        {
+            line.enabled = visible;
+        }
+    }
+
+    public void SetMouseHoldActive(bool active)
+    {
+        motionHeldByMouse = active;
+        if (active && ropeAttachPoint != null)
+        {
+            previousAttachPosition = ropeAttachPoint.position;
+            attachPointVelocity = Vector3.zero;
+        }
+    }
+
+    public void SetStateFromAttachDirection(Vector3 pivotToAttach, Vector3 releaseVelocity)
+    {
+        if (pivotPoint == null || ropeAttachPoint == null)
+        {
+            return;
+        }
+
+        if (!initialized)
+        {
+            InitializeSimulation();
+        }
+
+        origin = pivotPoint.position;
+        float safeLength = Mathf.Max(0.001f, ropeLength);
+        Vector3 direction = pivotToAttach.sqrMagnitude > 0.000001f ? pivotToAttach.normalized : Vector3.down;
+        Vector3 attachPosition = origin + direction * safeLength;
+
+        float newTheta = Mathf.Acos(Mathf.Clamp(-direction.y, -1f, 1f));
+        float newPhi = Mathf.Atan2(direction.z, direction.x);
+        float sinTheta = Mathf.Sin(newTheta);
+
+        Vector3 eTheta = new Vector3(
+            Mathf.Cos(newTheta) * Mathf.Cos(newPhi),
+            Mathf.Sin(newTheta),
+            Mathf.Cos(newTheta) * Mathf.Sin(newPhi)
+        );
+        Vector3 ePhi = new Vector3(-Mathf.Sin(newPhi), 0f, Mathf.Cos(newPhi));
+
+        float newThetaDot = Vector3.Dot(releaseVelocity, eTheta) / safeLength;
+        float newPhiDot = sinTheta > 0.001f ? Vector3.Dot(releaseVelocity, ePhi) / (safeLength * sinTheta) : 0f;
+
+        if (!float.IsFinite(newThetaDot)) newThetaDot = 0f;
+        if (!float.IsFinite(newPhiDot)) newPhiDot = 0f;
+
+        theta = newTheta;
+        phi = newPhi;
+        thetaDot = Mathf.Clamp(newThetaDot, -6f, 6f);
+        phiDot = Mathf.Clamp(newPhiDot, -6f, 6f);
+        state = new Vector4(thetaDot, phiDot, theta, phi);
+        attachPointVelocity = releaseVelocity;
+        previousAttachPosition = attachPosition;
+        MoveBucketByAttachPoint(attachPosition);
+        UpdatePhysicalOutputs(theta);
+    }
+
+    public void SetStateFromAttachDirection(Vector3 pivotToAttach)
+    {
+        SetStateFromAttachDirection(pivotToAttach, Vector3.zero);
     }
 
     public void ResetPendulum()
     {
+        motionHeldByMouse = false;
         paintMass = initialPaintMass;
 
         initialized = false;
         InitializeSimulation();
+    }
+
+    private static bool IsFinite(Vector3 value)
+    {
+        return float.IsFinite(value.x) && float.IsFinite(value.y) && float.IsFinite(value.z);
+    }
+
+    private static Vector3 SafeVector(Vector3 value, Vector3 fallback)
+    {
+        return IsFinite(value) ? value : fallback;
+    }
+
+    private static void DestroyRuntime(Object target)
+    {
+        if (target == null)
+        {
+            return;
+        }
+
+        if (Application.isPlaying)
+        {
+            Destroy(target);
+        }
+        else
+        {
+            DestroyImmediate(target);
+        }
+    }
+
+    private void OnDestroy()
+    {
+        DestroyRuntime(debugMaterial);
+        if (pivotDebugMarker != null) DestroyRuntime(pivotDebugMarker.gameObject);
+        if (attachDebugMarker != null) DestroyRuntime(attachDebugMarker.gameObject);
+        if (bucketDebugMarker != null) DestroyRuntime(bucketDebugMarker.gameObject);
+        if (pivotAttachDebugLine != null) DestroyRuntime(pivotAttachDebugLine.gameObject);
+        if (attachBucketDebugLine != null) DestroyRuntime(attachBucketDebugLine.gameObject);
     }
 
     public void SetPaintAmount(float amount)

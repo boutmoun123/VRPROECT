@@ -14,9 +14,12 @@ public class SimulationUIController : MonoBehaviour
     public MassSpringRope ropeController;
     public Simulation3D fluidSimulation;
     public PaintParticleEmitter paintEmitter;
+    public BucketPaintReservoir paintReservoir;
     public PaintingSurface paintingSurface;
     public PaintExperimentManager experimentManager;
     public MouseCameraController mouseCameraController;
+    public MouseGrabController mouseGrabController;
+    public IndependentFluidVisualizer fluidPreview;
 
     [Header("Sliders - Pendulum")]
     public Slider ropeLengthSlider;
@@ -62,13 +65,19 @@ public class SimulationUIController : MonoBehaviour
     public TMP_Text potentialEnergyText;
 
     [Header("Paint Values")]
-    public float emissionRate = 120f;
-    public float exitSpeed = 3f;
-    public float viscosity = 0.5f;
-    public float holeDiameter = 0.08f;
+    public float emissionRate = 15f;
+    public float exitSpeed = 1.8f;
+    public float viscosity = 0.65f;
+    public float holeDiameter = 0.01f;
     public float bucketWeight = 2f;
     public float bucketRadius = 0.55f;
-    public float initialPaintAmount = 1f;
+    public bool autoEstimatePaintCapacityFromBucketRadius;
+    public Vector3 pivotPosition = new Vector3(0f, 4f, 0f);
+    public float swingDirectionDegrees = 0f;
+    public int targetSwingCount = 10;
+    public bool unlimitedSwings;
+    public float initialPaintAmount = 20f;
+    public float paintCapacity = 30f;
     public float humidity = 0.35f;
     public float ropeFlexibility = 0.18f;
     public float simulationDurationLimit = 30f;
@@ -82,11 +91,13 @@ public class SimulationUIController : MonoBehaviour
     public bool disableLegacyUIVisuals = true;
     public bool enableDebugOnGUI = false;
     public bool showLegacyFluidParticles = false;
+    public bool advancedPaintMode = false;
 
     private float simulationTime;
     private bool isPaused = true;
     private int swingCount;
     private bool swingCounterReady;
+    private bool targetSwingCompleted;
     private float previousRadialVelocity;
     private string statusText = "Paused";
     private string userMessage = "";
@@ -103,8 +114,12 @@ public class SimulationUIController : MonoBehaviour
     private float currentUiScale = 1f;
     private TMP_Text topStatusText;
     private TMP_Text mouseCameraDebugText;
+    private TMP_Text mouseGrabDebugText;
+    private TMP_Text ropeDebugText;
     private TMP_Text referenceWarningText;
     private TMP_Text particleWarningText;
+    private TMP_Text paintStatusText;
+    private TMP_Text fluidPreviewStatsText;
     private TMP_Text lastImagePathText;
     private TMP_Text lastReportPathText;
     private TMP_Text comparisonText;
@@ -113,6 +128,7 @@ public class SimulationUIController : MonoBehaviour
     private TMP_Dropdown surfaceTypeDropdown;
     private TMP_Dropdown canvasOrientationDropdown;
     private TMP_Dropdown trailModeDropdown;
+    private TMP_Dropdown mixModeDropdown;
     private Slider canvasTiltSlider;
     private ScrollRect tabContentScrollRect;
     private Scrollbar tabContentScrollbar;
@@ -122,11 +138,14 @@ public class SimulationUIController : MonoBehaviour
     private readonly List<Button> tabButtons = new List<Button>();
     private DashboardTab activeTab = DashboardTab.Motion;
     private bool uiVisible = true;
+    private OpenBucketMesh openBucketMesh;
+    private Transform paintExitPoint;
 
     private enum DashboardTab
     {
         Motion,
         Paint,
+        FluidPreview,
         Environment,
         Canvas,
         Results,
@@ -156,6 +175,7 @@ public class SimulationUIController : MonoBehaviour
     private void Start()
     {
         InitializeSliders();
+        SynchronizeInitialPaintAmount();
         if (!buildUnifiedCanvasUI)
         {
             ConnectSliders();
@@ -175,6 +195,60 @@ public class SimulationUIController : MonoBehaviour
 
         UpdateValueTexts();
         UpdateInfoTexts();
+    }
+
+    private void SynchronizeInitialPaintAmount()
+    {
+        initialPaintAmount = Mathf.Max(0f, initialPaintAmount);
+        if (paintReservoir != null)
+        {
+            paintReservoir.SetCapacity(Mathf.Max(paintReservoir.capacity, initialPaintAmount));
+            paintReservoir.SetPaintAmount(initialPaintAmount);
+            paintReservoir.SetSelectedColor(paintColor);
+        }
+        else if (paintEmitter != null)
+        {
+            paintEmitter.SetPaintAmount(initialPaintAmount);
+        }
+    }
+
+    private void ApplyInitialPaintAmountFromSlider(bool refillRuntimePaint)
+    {
+        initialPaintAmount = Mathf.Max(0f, initialPaintAmount);
+
+        if (paintEmitter != null)
+        {
+            if (refillRuntimePaint)
+            {
+                paintEmitter.SetPaintAmount(initialPaintAmount);
+            }
+            else
+            {
+                paintEmitter.SetInitialPaintAmount(initialPaintAmount, refillRemaining: false);
+            }
+        }
+
+        if (paintReservoir != null)
+        {
+            paintReservoir.SetCapacity(Mathf.Max(paintReservoir.capacity, initialPaintAmount));
+            if (refillRuntimePaint)
+            {
+                paintReservoir.SetPaintAmount(initialPaintAmount);
+            }
+            else
+            {
+                paintReservoir.SetInitialPaintAmount(initialPaintAmount, refillCurrent: false);
+                paintReservoir.BindEmitter(paintEmitter);
+            }
+            paintReservoir.SetSelectedColor(paintColor);
+        }
+
+        if (pendulumController != null)
+        {
+            pendulumController.SetPaintAmount(refillRuntimePaint && paintEmitter != null
+                ? paintEmitter.remainingPaintAmount
+                : initialPaintAmount);
+        }
     }
 
     private void Update()
@@ -202,6 +276,8 @@ public class SimulationUIController : MonoBehaviour
         }
 
         UpdateFpsCounter();
+        UpdateBucketStatus();
+        SyncLegacyPaintPreview();
         UpdateInfoTexts();
         UpdateUnifiedCanvasTexts();
     }
@@ -230,6 +306,11 @@ public class SimulationUIController : MonoBehaviour
             SetSliderValueWithoutNotify(gravitySlider, pendulumController.gravity);
             bucketWeight = pendulumController.bucketEmptyMass;
             initialPaintAmount = pendulumController.paintMass;
+            swingDirectionDegrees = NormalizeDegrees(pendulumController.phi * Mathf.Rad2Deg);
+            if (pendulumController.pivotPoint != null)
+            {
+                pivotPosition = pendulumController.pivotPoint.position;
+            }
         }
         else
         {
@@ -255,12 +336,31 @@ public class SimulationUIController : MonoBehaviour
             viscosity = paintEmitter.viscosity;
             holeDiameter = paintEmitter.holeDiameter;
             exitSpeed = paintEmitter.flowSpeed;
+            emissionRate = paintEmitter.flowMultiplier > 0f ? paintEmitter.flowMultiplier : emissionRate;
             humidity = paintEmitter.humidity;
             paintColor = paintEmitter.paintColor;
         }
 
+        if (paintReservoir != null)
+        {
+            paintCapacity = paintReservoir.capacity;
+            initialPaintAmount = paintReservoir.initialPaintAmount;
+            paintColor = paintReservoir.selectedPaintColor;
+        }
+
+        if (openBucketMesh == null)
+        {
+            openBucketMesh = FindFirstObjectByType<OpenBucketMesh>();
+        }
+
+        if (openBucketMesh != null)
+        {
+            bucketRadius = openBucketMesh.topRadius;
+        }
+
         if (paintingSurface != null)
         {
+            paintingSurface.strokeRadius = Mathf.Clamp(paintingSurface.strokeRadius <= 0.2f ? 1f : paintingSurface.strokeRadius, 0.3f, 3f);
             canvasWidth = paintingSurface.currentWidth > 0.001f
                 ? paintingSurface.currentWidth
                 : paintingSurface.localHalfExtents.x * 2f * paintingSurface.transform.localScale.x;
@@ -279,6 +379,12 @@ public class SimulationUIController : MonoBehaviour
                 }
             }
         }
+
+        if (!advancedPaintMode && emissionRate > 40f)
+        {
+            emissionRate = 15f;
+        }
+        emissionRate = Mathf.Clamp(emissionRate <= 0f ? 15f : emissionRate, 1f, advancedPaintMode ? 120f : 40f);
 
         SetSliderValueWithoutNotify(emissionRateSlider, emissionRate);
         SetSliderValueWithoutNotify(exitSpeedSlider, exitSpeed);
@@ -313,8 +419,8 @@ public class SimulationUIController : MonoBehaviour
 
         if (ropeController != null)
         {
-            ropeController.ropeLength = value + 0.08f;
-            ropeController.ResetRope();
+            ropeController.ropeLength = value;
+            ropeController.SnapToCurrentEndpoints();
         }
 
         ResetCountersOnly();
@@ -412,7 +518,8 @@ public class SimulationUIController : MonoBehaviour
 
     private void ChangeEmissionRate(float value)
     {
-        emissionRate = value;
+        emissionRate = Mathf.Clamp(value, 1f, advancedPaintMode ? 120f : 40f);
+        SetSliderValueWithoutNotify(emissionRateSlider, emissionRate);
 
         if (pendulumController != null)
         {
@@ -451,18 +558,11 @@ public class SimulationUIController : MonoBehaviour
     private void ChangePaintAmount(float value)
     {
         initialPaintAmount = Mathf.Max(0f, value);
-
-        if (paintEmitter != null)
-        {
-            paintEmitter.SetPaintAmount(initialPaintAmount);
-        }
-
-        if (pendulumController != null)
-        {
-            pendulumController.SetPaintAmount(initialPaintAmount);
-        }
+        bool refillRuntimePaint = isPaused && simulationTime <= 0.0001f;
+        ApplyInitialPaintAmountFromSlider(refillRuntimePaint);
 
         ApplyExtendedSettings(resetMotion: false);
+        SyncLegacyPaintPreview();
         RefreshTexts();
     }
 
@@ -484,10 +584,14 @@ public class SimulationUIController : MonoBehaviour
     private void ApplyExtendedSettings(bool resetMotion)
     {
         bucketWeight = Mathf.Max(0.001f, bucketWeight);
-        bucketRadius = Mathf.Max(0.05f, bucketRadius);
+        bucketRadius = Mathf.Clamp(bucketRadius, 0.15f, 1f);
+        pivotPosition = ClampPivotPosition(pivotPosition);
+        swingDirectionDegrees = NormalizeDegrees(swingDirectionDegrees);
+        targetSwingCount = Mathf.Clamp(targetSwingCount, 1, 50);
         initialPaintAmount = Mathf.Max(0f, initialPaintAmount);
         holeDiameter = Mathf.Max(0.001f, holeDiameter);
         viscosity = Mathf.Max(0.001f, viscosity);
+        emissionRate = Mathf.Clamp(emissionRate <= 0f ? 15f : emissionRate, 1f, advancedPaintMode ? 120f : 40f);
         humidity = Mathf.Clamp01(humidity);
         ropeFlexibility = Mathf.Clamp(ropeFlexibility, 0f, 1f);
         simulationDurationLimit = Mathf.Max(0f, simulationDurationLimit);
@@ -495,19 +599,28 @@ public class SimulationUIController : MonoBehaviour
         if (pendulumController != null)
         {
             pendulumController.bucketEmptyMass = bucketWeight;
+            if (pendulumController.pivotPoint != null)
+            {
+                pendulumController.pivotPoint.position = pivotPosition;
+            }
+            pendulumController.phi = swingDirectionDegrees * Mathf.Deg2Rad;
             pendulumController.paintMass = paintEmitter != null ? paintEmitter.remainingPaintAmount : initialPaintAmount;
             pendulumController.simulatePaintLoss = false;
             pendulumController.paintMassFlowRate = emissionRate / 1200f;
         }
 
+        ApplyBucketRadiusToSystems();
+        ApplyPivotToSystems(resetMotion);
+
         if (ropeController != null)
         {
-            ropeController.bendAmount = ropeFlexibility;
+            ApplyMassSpringRopeSettings();
         }
 
         if (paintingSurface != null)
         {
             paintingSurface.paintColor = paintColor;
+            paintingSurface.strokeRadius = Mathf.Clamp(paintingSurface.strokeRadius <= 0.2f ? 1f : paintingSurface.strokeRadius, 0.3f, 3f);
             string selectedSurface = surfaceTypes[Mathf.Clamp(surfaceTypeIndex, 0, surfaceTypes.Length - 1)];
             if (canvasOrientationDropdown != null)
             {
@@ -529,18 +642,128 @@ public class SimulationUIController : MonoBehaviour
         {
             float gravityValue = pendulumController != null ? pendulumController.gravity : Mathf.Abs(fluidSimulation != null ? fluidSimulation.gravity : 9.81f);
             float airValue = pendulumController != null ? pendulumController.airResistanceCoefficient : 0.05f;
+            paintEmitter.flowMultiplier = emissionRate;
             paintEmitter.ApplySettings(initialPaintAmount, holeDiameter, viscosity, exitSpeed, gravityValue, airValue, humidity, paintColor);
         }
+
+        if (paintReservoir != null)
+        {
+            paintReservoir.SetCapacity(paintCapacity);
+            paintReservoir.SetSelectedColor(paintColor);
+            paintReservoir.BindEmitter(paintEmitter);
+        }
+
+        SyncLegacyPaintPreview();
 
         if (experimentManager != null)
         {
             experimentManager.bucketRadius = bucketRadius;
+            experimentManager.targetSwingCount = unlimitedSwings ? 0 : targetSwingCount;
+            experimentManager.completedSwingCount = swingCount;
+            experimentManager.swingTargetCompleted = targetSwingCompleted;
+            experimentManager.swingDirectionDegrees = swingDirectionDegrees;
+            experimentManager.pivotPosition = pivotPosition;
         }
 
         if (resetMotion)
         {
             ResetSimulation();
         }
+    }
+
+    private void ApplyBucketRadiusToSystems()
+    {
+        if (openBucketMesh == null)
+        {
+            openBucketMesh = FindFirstObjectByType<OpenBucketMesh>();
+        }
+
+        if (openBucketMesh != null)
+        {
+            float previousTopRadius = Mathf.Max(0.001f, openBucketMesh.topRadius);
+            float bottomRatio = openBucketMesh.bottomRadius / previousTopRadius;
+            float holeRatio = openBucketMesh.holeRadius / previousTopRadius;
+            openBucketMesh.topRadius = bucketRadius;
+            openBucketMesh.bottomRadius = Mathf.Clamp(bucketRadius * bottomRatio, 0.05f, bucketRadius * 0.95f);
+            openBucketMesh.holeRadius = Mathf.Clamp(bucketRadius * holeRatio, 0.01f, bucketRadius * 0.45f);
+            openBucketMesh.BuildBucket();
+
+            if (paintExitPoint == null)
+            {
+                GameObject exitObject = GameObject.Find("PaintExitPoint");
+                paintExitPoint = exitObject != null ? exitObject.transform : null;
+            }
+
+            if (paintExitPoint != null)
+            {
+                paintExitPoint.localPosition = new Vector3(0f, -openBucketMesh.height * 0.5f - 0.02f, 0f);
+            }
+        }
+
+        if (paintReservoir != null)
+        {
+            float height = openBucketMesh != null ? openBucketMesh.height : 1.4f;
+            float estimatedCapacity = Mathf.PI * bucketRadius * bucketRadius * height * 4.2f;
+            if (autoEstimatePaintCapacityFromBucketRadius)
+            {
+                paintCapacity = Mathf.Max(initialPaintAmount, estimatedCapacity);
+            }
+            paintReservoir.SetCapacity(paintCapacity);
+            paintReservoir.AutoFitLiquidToBucket();
+        }
+    }
+
+    private void ApplyPivotToSystems(bool resetPendulumPose)
+    {
+        pivotPosition = ClampPivotPosition(pivotPosition);
+        if (pendulumController != null && pendulumController.pivotPoint != null)
+        {
+            pendulumController.pivotPoint.position = pivotPosition;
+            if (resetPendulumPose)
+            {
+                pendulumController.ResetPendulum();
+            }
+        }
+
+        if (ropeController != null)
+        {
+            ropeController.SnapToCurrentEndpoints();
+        }
+    }
+
+    private void ApplySwingDirection(bool resetPendulumPose)
+    {
+        if (pendulumController == null)
+        {
+            return;
+        }
+
+        swingDirectionDegrees = NormalizeDegrees(swingDirectionDegrees);
+        pendulumController.phi = swingDirectionDegrees * Mathf.Deg2Rad;
+        if (resetPendulumPose)
+        {
+            pendulumController.ResetPendulum();
+            ResetCountersOnly();
+        }
+    }
+
+    private static Vector3 ClampPivotPosition(Vector3 value)
+    {
+        return new Vector3(
+            Mathf.Clamp(value.x, -8f, 8f),
+            Mathf.Clamp(value.y, 0.5f, 12f),
+            Mathf.Clamp(value.z, -8f, 8f)
+        );
+    }
+
+    private static float NormalizeDegrees(float degrees)
+    {
+        degrees %= 360f;
+        if (degrees < 0f)
+        {
+            degrees += 360f;
+        }
+        return degrees;
     }
 
     private void UpdateValueTexts()
@@ -591,12 +814,13 @@ public class SimulationUIController : MonoBehaviour
         }
 
         if (swingCountText != null)
-            swingCountText.text = "Swing Count: " + swingCount;
+            swingCountText.text = "Swing Count: " + swingCount + " / " + (unlimitedSwings ? "Unlimited" : targetSwingCount.ToString());
 
         if (paintRemainingText != null && pendulumController != null)
         {
+            float capacity = paintReservoir != null ? paintReservoir.capacity : paintCapacity;
             float percent = paintEmitter != null
-                ? Mathf.Clamp01(paintEmitter.remainingPaintAmount / Mathf.Max(0.001f, paintEmitter.initialPaintAmount)) * 100f
+                ? Mathf.Clamp01(paintEmitter.remainingPaintAmount / Mathf.Max(0.001f, capacity)) * 100f
                 : pendulumController.PaintRemainingFraction * 100f;
             paintRemainingText.text = "Paint Remaining: " + percent.ToString("0") + "%";
         }
@@ -658,6 +882,10 @@ public class SimulationUIController : MonoBehaviour
         if (reachedOuterTurn && simulationTime > 0.2f)
         {
             swingCount++;
+            if (!unlimitedSwings && swingCount >= targetSwingCount)
+            {
+                CompleteSwingTarget();
+            }
         }
 
         previousRadialVelocity = radialVelocity;
@@ -665,11 +893,38 @@ public class SimulationUIController : MonoBehaviour
 
     public void StartSimulation()
     {
+        if (targetSwingCompleted)
+        {
+            targetSwingCompleted = false;
+            swingCount = 0;
+            swingCounterReady = false;
+        }
+
         isPaused = false;
-        statusText = "Running";
+        statusText = paintEmitter != null && paintEmitter.IsBucketEmpty ? "Bucket Empty" : "Running";
+        if (paintEmitter != null)
+        {
+            paintEmitter.emissionEnabled = true;
+        }
         Time.timeScale = 1f;
+        SyncLegacyPaintPreview();
         SetFluidPaused(false);
         SetPaintEmitterPaused(false);
+    }
+
+    private void CompleteSwingTarget()
+    {
+        if (targetSwingCompleted)
+        {
+            return;
+        }
+
+        targetSwingCompleted = true;
+        statusText = "Completed";
+        if (paintEmitter != null)
+        {
+            paintEmitter.emissionEnabled = false;
+        }
     }
 
     public void PauseSimulation()
@@ -684,10 +939,21 @@ public class SimulationUIController : MonoBehaviour
     public void ResetSimulation()
     {
         ResetCountersOnly();
+        ApplyInitialPaintAmountFromSlider(refillRuntimePaint: true);
 
         if (pendulumController != null)
         {
+            if (pendulumController.pivotPoint != null)
+            {
+                pendulumController.pivotPoint.position = ClampPivotPosition(pivotPosition);
+            }
+            pendulumController.phi = NormalizeDegrees(swingDirectionDegrees) * Mathf.Deg2Rad;
             pendulumController.ResetPendulum();
+        }
+
+        if (mouseGrabController != null)
+        {
+            mouseGrabController.ResetDragState();
         }
 
         ResetRope();
@@ -695,6 +961,7 @@ public class SimulationUIController : MonoBehaviour
         if (fluidSimulation != null)
         {
             fluidSimulation.ResetFluid();
+            SyncLegacyPaintPreview();
             fluidSimulation.SetPaused(true);
         }
 
@@ -703,6 +970,14 @@ public class SimulationUIController : MonoBehaviour
             paintEmitter.ResetEmitter(resetPaintAmount: true);
             paintEmitter.SetPaused(true);
         }
+
+        if (paintReservoir != null)
+        {
+            paintReservoir.SetPaintAmount(initialPaintAmount);
+            paintReservoir.SetSelectedColor(paintColor);
+        }
+
+        SyncLegacyPaintPreview();
 
         if (paintingSurface != null)
         {
@@ -720,7 +995,12 @@ public class SimulationUIController : MonoBehaviour
         simulationTime = 0f;
         swingCount = 0;
         swingCounterReady = false;
+        targetSwingCompleted = false;
         previousRadialVelocity = 0f;
+        if (paintEmitter != null)
+        {
+            paintEmitter.emissionEnabled = true;
+        }
     }
 
     private void RefreshTexts()
@@ -733,16 +1013,109 @@ public class SimulationUIController : MonoBehaviour
     {
         if (ropeController != null)
         {
-            ropeController.ResetRope();
+            ropeController.SnapToCurrentEndpoints();
         }
+    }
+
+    private void ResetBucketToPivotFromUI()
+    {
+        if (pendulumController == null)
+        {
+            userMessage = "Pendulum controller is missing.";
+            return;
+        }
+
+        pendulumController.ResetBucketToPivot();
+        if (ropeController != null)
+        {
+            ropeController.SnapToCurrentEndpoints();
+        }
+
+        userMessage = "Bucket reset from current pivot, rope length, start angle, and swing direction.";
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void SyncLegacyPaintPreview()
+    {
+        if (fluidSimulation == null)
+        {
+            SyncIndependentFluidPreviewColor();
+            return;
+        }
+
+        bool hasPaint = paintEmitter == null
+            ? initialPaintAmount > 0f
+            : paintEmitter.remainingPaintAmount > 0.0001f;
+        if (paintReservoir != null)
+        {
+            hasPaint = !paintReservoir.IsEmpty;
+        }
+        Color visibleColor = paintReservoir != null ? paintReservoir.VisiblePaintColor : paintColor;
+        fluidSimulation.ApplyLegacyPaintState(visibleColor, hasPaint);
+        SyncIndependentFluidPreviewColor();
+    }
+
+    private void SyncIndependentFluidPreviewColor()
+    {
+        if (fluidPreview == null)
+        {
+            return;
+        }
+
+        fluidPreview.paintReservoir = paintReservoir;
+        fluidPreview.paintEmitter = paintEmitter;
+        fluidPreview.pendulumController = pendulumController;
+        if (fluidPreview.colorSync)
+        {
+            fluidPreview.previewColor = paintReservoir != null ? paintReservoir.VisiblePaintColor : paintColor;
+        }
+    }
+
+    private void UpdateBucketStatus()
+    {
+        if (paintEmitter == null)
+        {
+            return;
+        }
+
+        if (paintEmitter.IsBucketEmpty)
+        {
+            if (!isPaused)
+            {
+                statusText = "Bucket Empty";
+            }
+        }
+        else if (!isPaused && statusText == "Bucket Empty")
+        {
+            statusText = "Running";
+        }
+    }
+
+    private void ApplyMassSpringRopeSettings()
+    {
+        if (ropeController == null)
+        {
+            return;
+        }
+
+        int segments = Mathf.Max(2, ropeController.nodeCount - 1);
+        ropeController.ApplyMassSpringSettings(
+            segments,
+            ropeController.stiffness,
+            ropeController.springDamping,
+            ropeFlexibility,
+            ropeController.lengthCorrectionIterations
+        );
     }
 
     private void SetFluidPaused(bool paused)
     {
         if (fluidSimulation != null)
         {
-            fluidSimulation.SetPaused(paused);
-            fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
+            SyncLegacyPaintPreview();
+            bool forcePause = paused || (paintEmitter != null && paintEmitter.IsBucketEmpty);
+            fluidSimulation.SetPaused(forcePause);
+            fluidSimulation.SetLegacyParticleMode(fluidSimulation.legacyParticleMode);
         }
     }
 
@@ -771,12 +1144,69 @@ public class SimulationUIController : MonoBehaviour
             mouseCameraController = FindFirstObjectByType<MouseCameraController>();
         }
 
+        if (mouseGrabController == null)
+        {
+            mouseGrabController = FindFirstObjectByType<MouseGrabController>();
+        }
+
+        if (mouseGrabController == null)
+        {
+            GameObject grabObject = GameObject.Find("MouseGrabController");
+            if (grabObject == null)
+            {
+                grabObject = new GameObject("MouseGrabController");
+            }
+            mouseGrabController = grabObject.AddComponent<MouseGrabController>();
+        }
+
+        if (fluidPreview == null)
+        {
+            fluidPreview = FindFirstObjectByType<IndependentFluidVisualizer>();
+        }
+
+        if (fluidPreview == null)
+        {
+            GameObject previewObject = GameObject.Find("IndependentFluidPreview");
+            if (previewObject == null)
+            {
+                previewObject = new GameObject("IndependentFluidPreview");
+            }
+            fluidPreview = previewObject.GetComponent<IndependentFluidVisualizer>();
+            if (fluidPreview == null)
+            {
+                fluidPreview = previewObject.AddComponent<IndependentFluidVisualizer>();
+            }
+        }
+        fluidPreview.pendulumController = pendulumController;
+        fluidPreview.paintReservoir = paintReservoir;
+        fluidPreview.paintEmitter = paintEmitter;
+
+        if (paintReservoir == null)
+        {
+            paintReservoir = FindFirstObjectByType<BucketPaintReservoir>();
+        }
+
+        if (paintReservoir == null && pendulumController != null)
+        {
+            paintReservoir = pendulumController.GetComponent<BucketPaintReservoir>();
+            if (paintReservoir == null)
+            {
+                paintReservoir = pendulumController.gameObject.AddComponent<BucketPaintReservoir>();
+            }
+        }
+
+        if (openBucketMesh == null)
+        {
+            openBucketMesh = FindFirstObjectByType<OpenBucketMesh>();
+        }
+
         Transform exitPoint = null;
         GameObject exitObject = GameObject.Find("PaintExitPoint");
         if (exitObject != null)
         {
             exitPoint = exitObject.transform;
         }
+        paintExitPoint = exitPoint;
 
         GameObject boardObject = GameObject.Find("PaintBoard");
         if (paintingSurface == null && boardObject != null)
@@ -795,7 +1225,8 @@ public class SimulationUIController : MonoBehaviour
 
         if (fluidSimulation != null)
         {
-            fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
+            fluidSimulation.SetLegacyParticleMode(showLegacyFluidParticles ? Simulation3D.LegacyParticleMode.Preview : Simulation3D.LegacyParticleMode.Hidden);
+            SyncLegacyPaintPreview();
         }
 
         if (paintEmitter == null)
@@ -816,7 +1247,34 @@ public class SimulationUIController : MonoBehaviour
         paintEmitter.exitPoint = exitPoint;
         paintEmitter.pendulum = pendulumController;
         paintEmitter.paintingSurface = paintingSurface;
+        paintEmitter.paintReservoir = paintReservoir;
         paintEmitter.Initialize();
+
+        if (mouseGrabController != null)
+        {
+            mouseGrabController.sceneCamera = Camera.main;
+            mouseGrabController.pendulum = pendulumController;
+            mouseGrabController.rope = ropeController;
+            mouseGrabController.paintEmitter = paintEmitter;
+            mouseGrabController.cameraController = mouseCameraController;
+            mouseGrabController.uiController = this;
+        }
+
+        if (paintReservoir != null)
+        {
+            paintReservoir.capacity = Mathf.Max(paintReservoir.capacity, initialPaintAmount);
+            paintCapacity = paintReservoir.capacity;
+            paintReservoir.BindEmitter(paintEmitter);
+            paintReservoir.Initialize();
+        }
+
+        if (fluidPreview != null)
+        {
+            fluidPreview.pendulumController = pendulumController;
+            fluidPreview.paintReservoir = paintReservoir;
+            fluidPreview.paintEmitter = paintEmitter;
+            fluidPreview.previewColor = paintReservoir != null ? paintReservoir.VisiblePaintColor : paintColor;
+        }
 
         if (experimentManager == null)
         {
@@ -836,8 +1294,15 @@ public class SimulationUIController : MonoBehaviour
         experimentManager.pendulum = pendulumController;
         experimentManager.rope = ropeController;
         experimentManager.emitter = paintEmitter;
+        experimentManager.paintReservoir = paintReservoir;
         experimentManager.paintingSurface = paintingSurface;
+        experimentManager.fluidSimulation = fluidSimulation;
         experimentManager.bucketRadius = bucketRadius;
+        experimentManager.targetSwingCount = unlimitedSwings ? 0 : targetSwingCount;
+        experimentManager.completedSwingCount = swingCount;
+        experimentManager.swingTargetCompleted = targetSwingCompleted;
+        experimentManager.swingDirectionDegrees = swingDirectionDegrees;
+        experimentManager.pivotPosition = pivotPosition;
 
         airResistanceSlider = airResistanceSlider == null ? FindSlider("Slider_AirResistance") : airResistanceSlider;
         pivotFrictionSlider = pivotFrictionSlider == null ? FindSlider("Slider_PivotFriction") : pivotFrictionSlider;
@@ -944,6 +1409,7 @@ public class SimulationUIController : MonoBehaviour
 
         CreateTabButton(tabBar, "Motion", DashboardTab.Motion);
         CreateTabButton(tabBar, "Paint", DashboardTab.Paint);
+        CreateTabButton(tabBar, "Fluid Preview", DashboardTab.FluidPreview);
         CreateTabButton(tabBar, "Environment", DashboardTab.Environment);
         CreateTabButton(tabBar, "Canvas", DashboardTab.Canvas);
         CreateTabButton(tabBar, "Results", DashboardTab.Results);
@@ -1153,6 +1619,9 @@ public class SimulationUIController : MonoBehaviour
             case DashboardTab.Paint:
                 CreatePaintTab(tabContentRoot);
                 break;
+            case DashboardTab.FluidPreview:
+                CreateFluidPreviewTab(tabContentRoot);
+                break;
             case DashboardTab.Environment:
                 CreateEnvironmentTab(tabContentRoot);
                 break;
@@ -1182,41 +1651,604 @@ public class SimulationUIController : MonoBehaviour
         CreateButton(buttonRow, "Pause / Resume", TogglePauseResume);
         CreateButton(buttonRow, "Reset All", ResetSimulation);
         ropeLengthSlider = CreateSliderRow(parent, "Rope Length", 0.5f, 8f, pendulumController != null ? pendulumController.ropeLength : 4f, "0.00 m", ChangeRopeLength, out ropeLengthValueText);
+        CreateBucketRequirementControls(parent);
+        CreateMassSpringRopeControls(parent);
         initialAngleSlider = CreateSliderRow(parent, "Start Angle", 0f, 80f, pendulumController != null ? pendulumController.theta * Mathf.Rad2Deg : 30f, "0 deg", ChangeInitialAngle, out initialAngleValueText);
         sidePushSlider = CreateSliderRow(parent, "Initial Velocity", -2f, 2f, pendulumController != null ? pendulumController.phiDot : 0f, "0.00", ChangeSidePush, out sidePushValueText);
+        CreateMouseGrabControls(parent);
         dampingSlider = CreateSliderRow(parent, "Damping", 0f, 0.25f, pendulumController != null ? pendulumController.damping : 0.05f, "0.000", ChangeDamping, out dampingValueText);
         CreateSliderRow(parent, "Rope Flexibility", 0f, 1f, ropeFlexibility, "0.00", value => { ropeFlexibility = value; ApplyExtendedSettings(false); }, out _);
+        mouseGrabDebugText = CreateText("MouseGrabDebug", parent, BuildMouseGrabDebugText(), 19, FontStyles.Normal, TextAlignmentOptions.TopLeft);
+        SetPreferredHeight(mouseGrabDebugText.rectTransform, 175f);
+        ropeDebugText = CreateText("RopeDebug", parent, BuildRopeDebugText(), 19, FontStyles.Normal, TextAlignmentOptions.TopLeft);
+        SetPreferredHeight(ropeDebugText.rectTransform, 450f);
+    }
+
+    private void CreateBucketRequirementControls(Transform parent)
+    {
+        CreateSection(parent, "Required Inputs");
+
+        CreateSliderRow(parent, "Bucket Weight / Mass", 0.2f, 10f, bucketWeight, "0.00 kg", value =>
+        {
+            bucketWeight = value;
+            ApplyExtendedSettings(false);
+        }, out _);
+
+        CreateSliderRow(parent, "Bucket Radius", 0.15f, 1f, bucketRadius, "0.00 m", value =>
+        {
+            bucketRadius = value;
+            ApplyExtendedSettings(false);
+        }, out _);
+
+        CreateDropdown(parent, "Auto Capacity From Radius", new[] { "Off", "On" }, autoEstimatePaintCapacityFromBucketRadius ? 1 : 0, value =>
+        {
+            autoEstimatePaintCapacityFromBucketRadius = value == 1;
+            ApplyExtendedSettings(false);
+        });
+
+        CreateDropdown(parent, "Show Bucket Debug", new[] { "Off", "On" }, pendulumController != null && pendulumController.showBucketDebug ? 1 : 0, value =>
+        {
+            if (pendulumController != null)
+            {
+                pendulumController.showBucketDebug = value == 1;
+            }
+        });
+
+        CreateSliderRow(parent, "Pivot X", -8f, 8f, pivotPosition.x, "0.00", value =>
+        {
+            pivotPosition.x = value;
+            ApplyPivotToSystems(true);
+        }, out _);
+
+        CreateSliderRow(parent, "Pivot Y", 0.5f, 12f, pivotPosition.y, "0.00", value =>
+        {
+            pivotPosition.y = value;
+            ApplyPivotToSystems(true);
+        }, out _);
+
+        CreateSliderRow(parent, "Pivot Z", -8f, 8f, pivotPosition.z, "0.00", value =>
+        {
+            pivotPosition.z = value;
+            ApplyPivotToSystems(true);
+        }, out _);
+
+        CreateSliderRow(parent, "Swing Direction Angle", 0f, 360f, swingDirectionDegrees, "0 deg", value =>
+        {
+            swingDirectionDegrees = value;
+            ApplySwingDirection(true);
+        }, out _);
+
+        CreateSliderRow(parent, "Number of Swings", 1f, 50f, targetSwingCount, "0", value =>
+        {
+            targetSwingCount = Mathf.Clamp(Mathf.RoundToInt(value), 1, 50);
+            targetSwingCompleted = false;
+            if (paintEmitter != null)
+            {
+                paintEmitter.emissionEnabled = true;
+            }
+        }, out _);
+
+        CreateDropdown(parent, "Swing Limit", new[] { "Target", "Unlimited" }, unlimitedSwings ? 1 : 0, value =>
+        {
+            unlimitedSwings = value == 1;
+            targetSwingCompleted = false;
+            if (paintEmitter != null)
+            {
+                paintEmitter.emissionEnabled = true;
+            }
+        });
+
+        CreateButton(parent, "Reset Bucket To Pivot", ResetBucketToPivotFromUI);
+    }
+
+    private void CreateMouseGrabControls(Transform parent)
+    {
+        CreateSection(parent, "Mouse Grab");
+        CreateDropdown(parent, "Mouse Grab", new[] { "Off", "On" }, mouseGrabController != null && mouseGrabController.mouseGrabEnabled ? 1 : 0, value =>
+        {
+            if (mouseGrabController != null)
+            {
+                mouseGrabController.mouseGrabEnabled = value == 1;
+                if (!mouseGrabController.mouseGrabEnabled)
+                {
+                    mouseGrabController.ResetDragState();
+                }
+            }
+        });
+
+        CreateDropdown(parent, "Grab Target", new[] { "Bucket", "Rope End" }, mouseGrabController != null ? (int)mouseGrabController.grabTarget : 0, value =>
+        {
+            if (mouseGrabController != null)
+            {
+                mouseGrabController.grabTarget = (MouseGrabController.GrabTarget)value;
+            }
+        });
+
+        CreateDropdown(parent, "Apply Release Velocity", new[] { "Off", "On" }, mouseGrabController == null || mouseGrabController.applyReleaseVelocity ? 1 : 0, value =>
+        {
+            if (mouseGrabController != null)
+            {
+                mouseGrabController.applyReleaseVelocity = value == 1;
+            }
+        });
+
+        CreateSliderRow(parent, "Grab Sensitivity", 0.25f, 3f, mouseGrabController != null ? mouseGrabController.grabSensitivity : 1f, "0.00", value =>
+        {
+            if (mouseGrabController != null)
+            {
+                mouseGrabController.grabSensitivity = value;
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Max Drag Angle", 5f, 89f, mouseGrabController != null ? mouseGrabController.maxDragAngle : 75f, "0 deg", value =>
+        {
+            if (mouseGrabController != null)
+            {
+                mouseGrabController.maxDragAngle = value;
+            }
+        }, out _);
+
+        CreateButton(parent, "Reset Drag State", () =>
+        {
+            if (mouseGrabController != null)
+            {
+                mouseGrabController.ResetDragState();
+            }
+        });
+    }
+
+    private void CreateMassSpringRopeControls(Transform parent)
+    {
+        CreateDropdown(parent, "Rope Type", new[] { MassSpringRope.RopeModelName }, 0, _ =>
+        {
+            if (ropeController != null)
+            {
+                ropeController.ropeType = MassSpringRope.RopeModelName;
+            }
+        });
+
+        CreateSliderRow(parent, "Rope Segments", 4f, 80f, ropeController != null ? Mathf.Max(2, ropeController.nodeCount - 1) : 44f, "0", value =>
+        {
+            if (ropeController != null)
+            {
+                ropeController.ApplyMassSpringSettings(Mathf.RoundToInt(value), ropeController.stiffness, ropeController.springDamping, ropeFlexibility, ropeController.lengthCorrectionIterations);
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Spring Stiffness", 200f, 6000f, ropeController != null ? ropeController.stiffness : 3000f, "0", value =>
+        {
+            if (ropeController != null)
+            {
+                ropeController.ApplyMassSpringSettings(Mathf.Max(2, ropeController.nodeCount - 1), value, ropeController.springDamping, ropeFlexibility, ropeController.lengthCorrectionIterations);
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Rope Damping", 0f, 200f, ropeController != null ? ropeController.springDamping : 70f, "0", value =>
+        {
+            if (ropeController != null)
+            {
+                ropeController.ApplyMassSpringSettings(Mathf.Max(2, ropeController.nodeCount - 1), ropeController.stiffness, value, ropeFlexibility, ropeController.lengthCorrectionIterations);
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Constraint Iterations", 0f, 30f, ropeController != null ? ropeController.lengthCorrectionIterations : 18f, "0", value =>
+        {
+            if (ropeController != null)
+            {
+                ropeController.ApplyMassSpringSettings(Mathf.Max(2, ropeController.nodeCount - 1), ropeController.stiffness, ropeController.springDamping, ropeFlexibility, Mathf.RoundToInt(value));
+            }
+        }, out _);
     }
 
     private void CreatePaintTab(Transform parent)
     {
-        CreateSliderRow(parent, "Paint Amount", 0f, 5f, initialPaintAmount, "0.00 kg", ChangePaintAmount, out _);
-        holeDiameterSlider = CreateSliderRow(parent, "Hole Diameter", 0.01f, 0.25f, holeDiameter, "0.000 m", ChangeHoleDiameter, out holeDiameterValueText);
+        CreateSliderRow(parent, "Paint Capacity", 0.1f, 100f, paintReservoir != null ? paintReservoir.capacity : paintCapacity, "0.00 kg", value =>
+        {
+            paintCapacity = value;
+            if (paintReservoir != null)
+            {
+                paintReservoir.SetCapacity(value);
+            }
+            ApplyExtendedSettings(false);
+        }, out _);
+        CreateSliderRow(parent, "Paint Amount", 0f, 100f, initialPaintAmount, "0.00 kg", ChangePaintAmount, out _);
+        holeDiameterSlider = CreateSliderRow(parent, "Hole Diameter", 0.005f, 0.08f, holeDiameter, "0.000 m", ChangeHoleDiameter, out holeDiameterValueText);
         viscositySlider = CreateSliderRow(parent, "Viscosity", 0.01f, 3f, viscosity, "0.00", ChangeViscosity, out viscosityValueText);
         exitSpeedSlider = CreateSliderRow(parent, "Exit Speed", 0f, 8f, exitSpeed, "0.00 m/s", ChangeExitSpeed, out exitSpeedValueText);
-        emissionRateSlider = CreateSliderRow(parent, "Flow Multiplier", 1f, 360f, emissionRate, "0", ChangeEmissionRate, out emissionRateValueText);
+        CreateDropdown(parent, "Advanced Paint Flow", new[] { "Off", "On" }, advancedPaintMode ? 1 : 0, value =>
+        {
+            advancedPaintMode = value == 1;
+            if (!advancedPaintMode)
+            {
+                emissionRate = Mathf.Min(emissionRate, 40f);
+            }
+            if (emissionRateSlider != null)
+            {
+                emissionRateSlider.maxValue = advancedPaintMode ? 120f : 40f;
+                SetSliderValueWithoutNotify(emissionRateSlider, emissionRate);
+            }
+            ApplyExtendedSettings(false);
+            RefreshTexts();
+        });
+        emissionRateSlider = CreateSliderRow(parent, "Flow Multiplier", 1f, advancedPaintMode ? 120f : 40f, emissionRate, "0", ChangeEmissionRate, out emissionRateValueText);
         CreateColorButtons(parent);
+        CreateColorMixControls(parent);
+        CreateReservoirDebugControls(parent);
         CreateTrailControls(parent);
+        CreateAirborneParticleControls(parent);
+        paintStatusText = CreateText("PaintStatus", parent, BuildPaintStatusText(), 19, FontStyles.Normal, TextAlignmentOptions.TopLeft);
+        SetPreferredHeight(paintStatusText.rectTransform, 720f);
         CreateButton(parent, "Clear Canvas", ClearCanvas);
+    }
+
+    private void CreateFluidPreviewTab(Transform parent)
+    {
+        EnsureFluidPreview();
+
+        CreateDropdown(parent, "Show Fluid Preview", new[] { "Off", "On" }, fluidPreview != null && fluidPreview.showPreview ? 1 : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.SetShowPreview(value == 1);
+            }
+        });
+
+        CreateDropdown(parent, "Preview Mode", new[] { "Follow Bucket Liquid", "Manual Debug" }, fluidPreview != null ? (int)fluidPreview.previewMode : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.previewMode = (IndependentFluidVisualizer.PreviewMode)value;
+                RebuildActiveTab();
+            }
+        });
+
+        CreateDropdown(parent, "Preview Render Mode", new[] { "Auto", "CPU ParticleSystem", "GPU Preview" }, fluidPreview != null ? (int)fluidPreview.previewRenderMode : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.previewRenderMode = (IndependentFluidVisualizer.PreviewRenderMode)value;
+                fluidPreview.ForceRebuildParticles();
+            }
+        });
+
+        CreateDropdown(parent, "Preview Quality", new[] { "Low 8k", "Medium 50k", "High 200k", "Ultra 1M" }, fluidPreview != null ? (int)fluidPreview.particlePreset : 1, value =>
+        {
+            ApplyFluidPreviewPreset((IndependentFluidVisualizer.ParticlePreset)value);
+        });
+
+        RectTransform presetRow = CreateButtonRow(parent);
+        CreateButton(presetRow, "Low 8k", () => ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.Low));
+        CreateButton(presetRow, "Medium 50k", () => ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.Medium));
+        CreateButton(presetRow, "High 200k", () => ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.High));
+        CreateButton(presetRow, "Ultra 1M", () => ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.Ultra));
+
+        CreateDropdown(parent, "Show Internal Particles", new[] { "Off", "On" }, fluidPreview != null && fluidPreview.showInternalParticles ? 1 : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.showInternalParticles = value == 1;
+                fluidPreview.ForceRebuildParticles();
+            }
+        });
+
+        CreateDropdown(parent, "Show Density Colors", new[] { "Off", "On" }, fluidPreview == null || fluidPreview.showDensityColors ? 1 : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.showDensityColors = value == 1;
+            }
+        });
+
+        CreateDropdown(parent, "Show Collision Flashes", new[] { "Off", "On" }, fluidPreview == null || fluidPreview.showCollisionFlashes ? 1 : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.showCollisionFlashes = value == 1;
+            }
+        });
+
+        CreateDropdown(parent, "Show Flow Layers", new[] { "Off", "On" }, fluidPreview == null || fluidPreview.showFlowLayers ? 1 : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.showFlowLayers = value == 1;
+            }
+        });
+
+        CreateDropdown(parent, "Show Particle Count Proof", new[] { "Off", "On" }, fluidPreview != null && fluidPreview.showParticleCountProof ? 1 : 0, value =>
+        {
+            if (fluidPreview != null)
+            {
+                fluidPreview.showParticleCountProof = value == 1;
+            }
+        });
+
+        if (fluidPreview != null)
+        {
+            CreateSection(parent, "Preview Follow Calibration");
+            CreateDropdown(parent, "Preview Follow Model", new[] { "Exact Slosh Offsets", "Acceleration Response", "Enhanced Educational" }, (int)fluidPreview.previewFollowModel, value =>
+            {
+                fluidPreview.previewFollowModel = (IndependentFluidVisualizer.PreviewFollowModel)value;
+            });
+            CreateDropdown(parent, "Show Liquid Follow Debug", new[] { "Off", "On" }, fluidPreview.showLiquidFollowDebug ? 1 : 0, value =>
+            {
+                fluidPreview.showLiquidFollowDebug = value == 1;
+            });
+            CreateDropdown(parent, "Swap Slosh Axes", new[] { "Off", "On" }, fluidPreview.swapSloshAxes ? 1 : 0, value =>
+            {
+                fluidPreview.swapSloshAxes = value == 1;
+            });
+            CreateDropdown(parent, "Invert Slosh X", new[] { "Off", "On" }, fluidPreview.invertSloshX ? 1 : 0, value =>
+            {
+                fluidPreview.invertSloshX = value == 1;
+            });
+            CreateDropdown(parent, "Invert Slosh Z", new[] { "Off", "On" }, fluidPreview.invertSloshZ ? 1 : 0, value =>
+            {
+                fluidPreview.invertSloshZ = value == 1;
+            });
+            CreateSliderRow(parent, "Slosh Gain X", 0.1f, 3f, fluidPreview.sloshGainX, "0.00", value =>
+            {
+                fluidPreview.sloshGainX = value;
+            }, out _);
+            CreateSliderRow(parent, "Slosh Gain Z", 0.1f, 3f, fluidPreview.sloshGainZ, "0.00", value =>
+            {
+                fluidPreview.sloshGainZ = value;
+            }, out _);
+            CreateSliderRow(parent, "Liquid Lag", 0.02f, 0.8f, fluidPreview.liquidLag, "0.00", value =>
+            {
+                fluidPreview.liquidLag = value;
+            }, out _);
+            CreateSliderRow(parent, "Liquid Damping", 0.2f, 8f, fluidPreview.liquidDamping, "0.00", value =>
+            {
+                fluidPreview.liquidDamping = value;
+            }, out _);
+            CreateSliderRow(parent, "Max Surface Tilt", 12f, 18f, fluidPreview.maxSurfaceTilt, "0 deg", value =>
+            {
+                fluidPreview.maxSurfaceTilt = value;
+            }, out _);
+            RectTransform followTestRow = CreateButtonRow(parent);
+            CreateButton(followTestRow, "Test Liquid Tilt X", () =>
+            {
+                fluidPreview.TestLiquidTiltX();
+            });
+            CreateButton(followTestRow, "Test Liquid Tilt Z", () =>
+            {
+                fluidPreview.TestLiquidTiltZ();
+            });
+            CreateButton(parent, "Reset Liquid Calibration", ResetFluidPreviewLiquidCalibration);
+
+            CreateSection(parent, "Preview Box Controls");
+            CreateSliderRow(parent, "Box Width", 0.8f, 5f, fluidPreview.previewBoxWidth, "0.00", value =>
+            {
+                fluidPreview.SetPreviewBoxSize(value, fluidPreview.previewBoxHeight, fluidPreview.previewBoxDepth);
+            }, out _);
+            CreateSliderRow(parent, "Box Height", 0.4f, 3f, fluidPreview.previewBoxHeight, "0.00", value =>
+            {
+                fluidPreview.SetPreviewBoxSize(fluidPreview.previewBoxWidth, value, fluidPreview.previewBoxDepth);
+            }, out _);
+            CreateSliderRow(parent, "Box Depth", 0.5f, 3f, fluidPreview.previewBoxDepth, "0.00", value =>
+            {
+                fluidPreview.SetPreviewBoxSize(fluidPreview.previewBoxWidth, fluidPreview.previewBoxHeight, value);
+            }, out _);
+            CreateSliderRow(parent, "Position X", -10f, 10f, fluidPreview.previewPositionX, "0.00", value =>
+            {
+                fluidPreview.SetPreviewPosition(value, fluidPreview.previewPositionY, fluidPreview.previewPositionZ);
+            }, out _);
+            CreateSliderRow(parent, "Position Y", -2f, 6f, fluidPreview.previewPositionY, "0.00", value =>
+            {
+                fluidPreview.SetPreviewPosition(fluidPreview.previewPositionX, value, fluidPreview.previewPositionZ);
+            }, out _);
+            CreateSliderRow(parent, "Position Z", -6f, 6f, fluidPreview.previewPositionZ, "0.00", value =>
+            {
+                fluidPreview.SetPreviewPosition(fluidPreview.previewPositionX, fluidPreview.previewPositionY, value);
+            }, out _);
+
+            RectTransform boxButtonRow = CreateButtonRow(parent);
+            CreateButton(boxButtonRow, "Reset Box Transform", ResetFluidPreviewBoxTransform);
+            CreateButton(boxButtonRow, "Force Rebuild Preview", ForceRebuildFluidPreview);
+
+            CreateSection(parent, "Preview Motion Controls");
+            CreateSliderRow(parent, "Motion Strength", 0f, 4f, fluidPreview.previewMotionStrength, "0.00", value =>
+            {
+                fluidPreview.previewMotionStrength = value;
+            }, out _);
+            CreateSliderRow(parent, "Wave Strength", 0f, 4f, fluidPreview.previewWaveStrength, "0.00", value =>
+            {
+                fluidPreview.previewWaveStrength = value;
+            }, out _);
+            CreateSliderRow(parent, "Turbulence", 0f, 2f, fluidPreview.previewTurbulenceStrength, "0.00", value =>
+            {
+                fluidPreview.previewTurbulenceStrength = value;
+            }, out _);
+            CreateSliderRow(parent, "Wall Bounce", 0f, 2f, fluidPreview.previewWallBounceStrength, "0.00", value =>
+            {
+                fluidPreview.previewWallBounceStrength = value;
+            }, out _);
+            CreateSliderRow(parent, "Flow Layers", 0f, 3f, fluidPreview.previewFlowLayerStrength, "0.00", value =>
+            {
+                fluidPreview.previewFlowLayerStrength = value;
+            }, out _);
+            CreateSliderRow(parent, "Particle Size", 0.3f, 3f, fluidPreview.previewParticleSizeMultiplier, "0.00x", value =>
+            {
+                fluidPreview.previewParticleSizeMultiplier = value;
+            }, out _);
+            CreateSliderRow(parent, "Particle Visibility", 0.2f, 3f, fluidPreview.previewParticleAlphaMultiplier, "0.00x", value =>
+            {
+                fluidPreview.previewParticleAlphaMultiplier = value;
+            }, out _);
+            CreateSliderRow(parent, "Glass Transparency", 0.02f, 0.25f, fluidPreview.previewGlassAlpha, "0.00", value =>
+            {
+                fluidPreview.previewGlassAlpha = value;
+            }, out _);
+            CreateSliderRow(parent, "Liquid Surface", 0.02f, 0.75f, fluidPreview.previewLiquidSurfaceAlpha, "0.00", value =>
+            {
+                fluidPreview.previewLiquidSurfaceAlpha = value;
+            }, out _);
+
+            RectTransform visualButtonRow = CreateButtonRow(parent);
+            CreateButton(visualButtonRow, "Reset Preview Visuals", ResetFluidPreviewVisuals);
+            CreateButton(visualButtonRow, "Reset Preview Motion", ResetFluidPreviewMotion);
+        }
+
+        CreateButton(parent, "Force Rebuild Preview Particles", ForceRebuildFluidPreviewParticles);
+
+        if (fluidPreview != null && fluidPreview.previewMode == IndependentFluidVisualizer.PreviewMode.ManualDebug)
+        {
+            CreateSection(parent, "Manual Debug");
+            CreateSliderRow(parent, "Preview Fill Percent", 5f, 100f, fluidPreview.fillPercent * 100f, "0%", value =>
+            {
+                fluidPreview.fillPercent = Mathf.Clamp01(value / 100f);
+            }, out _);
+            CreateSliderRow(parent, "Preview Particle Count", 25f, 1000000f, fluidPreview.previewParticleCount, "0", value =>
+            {
+                fluidPreview.SetPreviewParticleCount(Mathf.RoundToInt(value));
+            }, out _);
+            CreateSliderRow(parent, "Preview Slosh Strength", 0f, 1.5f, fluidPreview.sloshStrength, "0.00", value =>
+            {
+                fluidPreview.sloshStrength = value;
+            }, out _);
+            CreateSliderRow(parent, "Preview Motion Speed", 0.1f, 5f, fluidPreview.motionSpeed, "0.00", value =>
+            {
+                fluidPreview.motionSpeed = value;
+            }, out _);
+            CreateSliderRow(parent, "Preview Slosh Damping", 0.1f, 8f, fluidPreview.sloshDamping, "0.00", value =>
+            {
+                fluidPreview.sloshDamping = value;
+            }, out _);
+        }
+
+        fluidPreviewStatsText = CreateText("FluidPreviewStats", parent, fluidPreview != null ? fluidPreview.StatsText : "Fluid preview missing.", 19, FontStyles.Normal, TextAlignmentOptions.TopLeft);
+        SetPreferredHeight(fluidPreviewStatsText.rectTransform, 780f);
+    }
+
+    private void CreateReservoirDebugControls(Transform parent)
+    {
+        CreateSection(parent, "Reservoir Debug");
+
+        CreateDropdown(parent, "Force Show Liquid", new[] { "Off", "On" }, paintReservoir != null && paintReservoir.forceShowLiquidVisual ? 1 : 0, value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.forceShowLiquidVisual = value == 1;
+            }
+        });
+
+        CreateDropdown(parent, "Liquid Axis", new[] { "Local X", "Local Y", "Local Z" }, paintReservoir != null ? (int)paintReservoir.liquidAxis : 1, value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.liquidAxis = (BucketPaintReservoir.LiquidAxis)value;
+            }
+        });
+
+        CreateDropdown(parent, "Flip Liquid Axis", new[] { "Off", "On" }, paintReservoir != null && paintReservoir.flipAxis ? 1 : 0, value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.flipAxis = value == 1;
+            }
+        });
+
+        CreateSliderRow(parent, "Liquid Anchor Local Position X", -1.5f, 1.5f, paintReservoir != null ? paintReservoir.liquidAnchorLocalPosition.x : 0f, "0.00", value =>
+        {
+            if (paintReservoir != null)
+            {
+                Vector3 position = paintReservoir.liquidAnchorLocalPosition;
+                position.x = value;
+                paintReservoir.SetLiquidAnchorLocalPosition(position);
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Liquid Anchor Local Position Y", -1.5f, 1.5f, paintReservoir != null ? paintReservoir.liquidAnchorLocalPosition.y : 0f, "0.00", value =>
+        {
+            if (paintReservoir != null)
+            {
+                Vector3 position = paintReservoir.liquidAnchorLocalPosition;
+                position.y = value;
+                paintReservoir.SetLiquidAnchorLocalPosition(position);
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Liquid Anchor Local Position Z", -1.5f, 1.5f, paintReservoir != null ? paintReservoir.liquidAnchorLocalPosition.z : 0f, "0.00", value =>
+        {
+            if (paintReservoir != null)
+            {
+                Vector3 position = paintReservoir.liquidAnchorLocalPosition;
+                position.z = value;
+                paintReservoir.SetLiquidAnchorLocalPosition(position);
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Liquid Radius", 0.05f, 1.2f, paintReservoir != null ? paintReservoir.liquidRadius : 0.45f, "0.00", value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.liquidRadius = value;
+                paintReservoir.RebuildLiquidMesh();
+            }
+        }, out _);
+
+        CreateSliderRow(parent, "Liquid Thickness", 0.002f, 0.12f, paintReservoir != null ? paintReservoir.surfaceThickness : 0.035f, "0.000", value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.surfaceThickness = value;
+                paintReservoir.RebuildLiquidMesh();
+            }
+        }, out _);
+
+        CreateButton(parent, "Auto Fit Liquid To Bucket", () =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.AutoFitLiquidToBucket();
+            }
+        });
+    }
+
+    private void CreateColorMixControls(Transform parent)
+    {
+        int modeIndex = paintReservoir != null ? (int)paintReservoir.mixMode : 0;
+        mixModeDropdown = CreateDropdown(parent, "Mix Mode", new[] { "Single Color", "Mixed Bucket", "Sequential Colors" }, modeIndex, value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.SetMixMode((BucketPaintReservoir.PaintMixMode)value);
+            }
+            SyncLegacyPaintPreview();
+        });
+
+        CreateSliderRow(parent, "Color Mix Strength", 0f, 1f, paintReservoir != null ? paintReservoir.colorMixStrength : 0.55f, "0.00", value =>
+        {
+            if (paintReservoir != null)
+            {
+                paintReservoir.colorMixStrength = value;
+                paintReservoir.SetMixMode(paintReservoir.mixMode);
+            }
+            SyncLegacyPaintPreview();
+        }, out _);
+
+        RectTransform row = CreateButtonRow(parent);
+        CreateButton(row, "Add Color To Bucket", AddCurrentColorToBucket);
+        CreateButton(row, "Clear Colors", ClearBucketColors);
     }
 
     private void CreateTrailControls(Transform parent)
     {
-        int trailModeIndex = paintingSurface != null ? (int)paintingSurface.trailMode : (int)PaintingSurface.TrailRenderMode.Ribbon;
+        int trailModeIndex = paintingSurface != null ? (int)paintingSurface.ActiveTrailMode : (int)PaintingSurface.TrailRenderMode.Ribbon;
         trailModeDropdown = CreateDropdown(parent, "Trail Mode", new[] { "Dots", "Trails", "Ribbon" }, Mathf.Clamp(trailModeIndex, 0, 2), value =>
         {
             if (paintingSurface != null)
             {
-                paintingSurface.trailMode = (PaintingSurface.TrailRenderMode)value;
-                paintingSurface.trailModeEnabled = paintingSurface.trailMode != PaintingSurface.TrailRenderMode.Dots;
+                paintingSurface.SetTrailMode((PaintingSurface.TrailRenderMode)value);
             }
         });
 
-        CreateSliderRow(parent, "Stroke Radius", 0.005f, 0.12f, paintingSurface != null ? paintingSurface.strokeRadius : 0.03f, "0.000", value =>
+        CreateSliderRow(parent, "Stroke Radius Multiplier", 0.3f, 3f, paintingSurface != null ? paintingSurface.strokeRadius : 1f, "0.00x", value =>
         {
             if (paintingSurface != null)
             {
-                paintingSurface.strokeRadius = value;
+                paintingSurface.strokeRadius = Mathf.Clamp(value, 0.3f, 3f);
             }
         }, out _);
 
@@ -1251,6 +2283,33 @@ public class SimulationUIController : MonoBehaviour
                 paintEmitter.deterministicTrailTestMode = value == 1;
             }
         });
+
+        CreateSection(parent, "Paint Mode Tests");
+        RectTransform testRow = CreateButtonRow(parent);
+        CreateButton(testRow, "Test Dots", () => DrawPaintModeTest(PaintingSurface.TrailRenderMode.Dots));
+        CreateButton(testRow, "Test Trails", () => DrawPaintModeTest(PaintingSurface.TrailRenderMode.Trails));
+        CreateButton(testRow, "Test Ribbon", () => DrawPaintModeTest(PaintingSurface.TrailRenderMode.Ribbon));
+        CreateButton(testRow, "Clear Canvas", ClearCanvas);
+    }
+
+    private void CreateAirborneParticleControls(Transform parent)
+    {
+        CreateSliderRow(parent, "Airborne Particle Size", 0.005f, 0.05f, paintEmitter != null ? paintEmitter.airborneParticleSize : 0.015f, "0.000 m", value =>
+        {
+            if (paintEmitter != null)
+            {
+                paintEmitter.airborneParticleSize = value;
+                paintEmitter.particleVisualScale = value;
+            }
+        }, out _);
+
+        CreateDropdown(parent, "Show Airborne Particles", new[] { "Off", "On" }, paintEmitter != null && paintEmitter.showAirborneParticles ? 1 : 0, value =>
+        {
+            if (paintEmitter != null)
+            {
+                paintEmitter.showAirborneParticles = value == 1;
+            }
+        });
     }
 
     private void CreateEnvironmentTab(Transform parent)
@@ -1276,9 +2335,126 @@ public class SimulationUIController : MonoBehaviour
             canvasTiltDegrees = value;
             ApplyExtendedSettings(false);
         }, out _);
+        CreateDropdown(parent, "Paint Render Mode", new[] { "World Decals Recommended", "Texture UV Legacy" }, paintingSurface != null && paintingSurface.paintRenderMode == PaintingSurface.PaintRenderMode.TextureUvLegacy ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetPaintRenderMode(value == 1 ? PaintingSurface.PaintRenderMode.TextureUvLegacy : PaintingSurface.PaintRenderMode.WorldDecals);
+                UpdateCanvasStatusText();
+            }
+        });
+        PaintingSurface.BoardMappingPlane[] mappingPlaneOptions =
+        {
+            PaintingSurface.BoardMappingPlane.LocalXZ,
+            PaintingSurface.BoardMappingPlane.LocalXY,
+            PaintingSurface.BoardMappingPlane.LocalYZ
+        };
+        int mappingPlaneIndex = 0;
+        if (paintingSurface != null)
+        {
+            for (int i = 0; i < mappingPlaneOptions.Length; i++)
+            {
+                if (paintingSurface.mappingPlane == mappingPlaneOptions[i])
+                {
+                    mappingPlaneIndex = i;
+                    break;
+                }
+            }
+        }
+
+        CreateDropdown(parent, "Mapping Plane", new[] { "LocalXZ", "LocalXY", "LocalYZ" }, mappingPlaneIndex, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetMappingPlane(mappingPlaneOptions[Mathf.Clamp(value, 0, mappingPlaneOptions.Length - 1)]);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Invert Right Axis", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.invertRightAxis ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetInvertRightAxis(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Invert Up Axis", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.invertUpAxis ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetInvertUpAxis(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Swap Axes", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.swapAxes ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetSwapAxes(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Show Paint Hit Debug Markers", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.showMappingDebugMarkers ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetShowMappingDebugMarkers(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Paint Hit Marker History", new[] { "Show Last Hit Only", "Show Last 10 Hits" }, paintingSurface != null ? (int)paintingSurface.debugMarkerHistoryMode : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.debugMarkerHistoryMode = (PaintingSurface.DebugMarkerHistoryMode)value;
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Invert Paint Decal Normal", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.invertPaintNormal ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetInvertPaintNormal(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Invert Collision Normal", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.invertBoardNormalForCollision ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetInvertBoardNormalForCollision(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "Paint Decals Always Visible Debug", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.paintDecalsAlwaysVisibleDebug ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetPaintDecalsAlwaysVisibleDebug(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
+        CreateDropdown(parent, "World Paint Fallback Geometry", new[] { "Off", "On" }, paintingSurface != null && paintingSurface.worldPaintFallbackGeometry ? 1 : 0, value =>
+        {
+            if (paintingSurface != null)
+            {
+                paintingSurface.SetWorldPaintFallbackGeometry(value == 1);
+                UpdateCanvasStatusText();
+            }
+        });
         CreateButton(parent, "Test UV Mapping", DrawUvMappingTest);
+        CreateButton(parent, "Test World Hit Mapping", DrawWorldHitMappingTest);
+        CreateButton(parent, "Test Particle Board Collision", TestParticleBoardCollision);
+        CreateButton(parent, "Test Visible World Paint", DrawVisibleWorldPaintTest);
+        CreateButton(parent, "Paint Under Bucket Test", PaintUnderBucketTest);
+        RectTransform worldTestRow = CreateButtonRow(parent);
+        CreateButton(worldTestRow, "Test World Dots", () => DrawPaintModeTest(PaintingSurface.TrailRenderMode.Dots));
+        CreateButton(worldTestRow, "Test World Trails", () => DrawPaintModeTest(PaintingSurface.TrailRenderMode.Trails));
+        CreateButton(worldTestRow, "Test World Ribbon", () => DrawPaintModeTest(PaintingSurface.TrailRenderMode.Ribbon));
+        CreateButton(parent, "Clear World Paint", ClearWorldPaint);
+        CreateButton(parent, "Auto Try 8 Mapping Modes", AutoTryEightMappingModes);
         canvasStatusText = CreateText("CanvasStatus", parent, "", 19, FontStyles.Normal, TextAlignmentOptions.TopLeft);
-        SetPreferredHeight(canvasStatusText.rectTransform, 560f);
+        SetPreferredHeight(canvasStatusText.rectTransform, 1080f);
         UpdateCanvasStatusText();
     }
 
@@ -1309,12 +2485,14 @@ public class SimulationUIController : MonoBehaviour
         CreateButton(presetRow, "High 200k", () => ApplyParticlePresetFromUI(Simulation3D.ParticleCountPreset.High));
         CreateButton(presetRow, "Ultra 1M", () => ApplyParticlePresetFromUI(Simulation3D.ParticleCountPreset.Ultra));
 
-        CreateDropdown(parent, "Legacy GPU Particles", new[] { "Hidden", "Visible" }, showLegacyFluidParticles ? 1 : 0, value =>
+        int legacyModeIndex = fluidSimulation != null ? (int)fluidSimulation.legacyParticleMode : 0;
+        CreateDropdown(parent, "Legacy GPU Particles", new[] { "Hidden", "Preview", "Stress Test" }, legacyModeIndex, value =>
         {
-            showLegacyFluidParticles = value == 1;
+            showLegacyFluidParticles = value != 0;
             if (fluidSimulation != null)
             {
-                fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
+                fluidSimulation.SetLegacyParticleMode((Simulation3D.LegacyParticleMode)value);
+                SyncLegacyPaintPreview();
             }
         });
 
@@ -1334,9 +2512,15 @@ public class SimulationUIController : MonoBehaviour
             perfText.text =
                 "Current Preset: " + fluidSimulation.particlePreset +
                 "\nGPU Particles: " + fluidSimulation.currentParticleCount.ToString("N0") +
+                "\nLegacy Preview: " + fluidSimulation.LegacyPreviewState +
+                "\nPreview Label: GPU Paint Particle Preview" +
                 "\nEstimated GPU Buffer Memory: " + fluidSimulation.estimatedGpuBufferMegabytes.ToString("0.0") + " MB" +
                 "\nFPS: " + currentFps.ToString("0") +
                 "\nPress H to hide/show the UI.";
+            if (fluidSimulation.legacyParticleMode == Simulation3D.LegacyParticleMode.StressTest)
+            {
+                perfText.text += "\nStress Test is performance visualization only; it does not affect painting metrics or reports.";
+            }
         }
     }
 
@@ -1375,6 +2559,7 @@ public class SimulationUIController : MonoBehaviour
         ropeLengthSlider = CreateSliderRow(content, "Rope Length", 0.5f, 8f, pendulumController != null ? pendulumController.ropeLength : 4f, "0.00 m", ChangeRopeLength, out ropeLengthValueText);
         initialAngleSlider = CreateSliderRow(content, "Start Angle", 0f, 80f, pendulumController != null ? pendulumController.theta * Mathf.Rad2Deg : 30f, "0 deg", ChangeInitialAngle, out initialAngleValueText);
         sidePushSlider = CreateSliderRow(content, "Initial Velocity", -2f, 2f, pendulumController != null ? pendulumController.phiDot : 0f, "0.00", ChangeSidePush, out sidePushValueText);
+        CreateMouseGrabControls(content);
         dampingSlider = CreateSliderRow(content, "Damping", 0f, 0.25f, pendulumController != null ? pendulumController.damping : 0.05f, "0.000", ChangeDamping, out dampingValueText);
         CreateSliderRow(content, "Rope Flexibility", 0f, 1f, ropeFlexibility, "0.00", value => { ropeFlexibility = value; ApplyExtendedSettings(false); }, out _);
 
@@ -1385,11 +2570,11 @@ public class SimulationUIController : MonoBehaviour
         CreateSliderRow(content, "Humidity", 0f, 1f, humidity, "0.00", value => { humidity = value; ApplyExtendedSettings(false); }, out _);
 
         CreateSection(content, "Paint");
-        CreateSliderRow(content, "Paint Amount", 0f, 5f, initialPaintAmount, "0.00 kg", ChangePaintAmount, out _);
-        holeDiameterSlider = CreateSliderRow(content, "Hole Diameter", 0.01f, 0.25f, holeDiameter, "0.000 m", ChangeHoleDiameter, out holeDiameterValueText);
+        CreateSliderRow(content, "Paint Amount", 0f, 100f, initialPaintAmount, "0.00 kg", ChangePaintAmount, out _);
+        holeDiameterSlider = CreateSliderRow(content, "Hole Diameter", 0.005f, 0.08f, holeDiameter, "0.000 m", ChangeHoleDiameter, out holeDiameterValueText);
         viscositySlider = CreateSliderRow(content, "Viscosity", 0.01f, 3f, viscosity, "0.00", ChangeViscosity, out viscosityValueText);
         exitSpeedSlider = CreateSliderRow(content, "Exit Speed", 0f, 8f, exitSpeed, "0.00 m/s", ChangeExitSpeed, out exitSpeedValueText);
-        emissionRateSlider = CreateSliderRow(content, "Flow Multiplier", 1f, 360f, emissionRate, "0", ChangeEmissionRate, out emissionRateValueText);
+        emissionRateSlider = CreateSliderRow(content, "Flow Multiplier", 1f, advancedPaintMode ? 120f : 40f, emissionRate, "0", ChangeEmissionRate, out emissionRateValueText);
         CreateColorButtons(content);
 
         CreateSection(content, "Canvas / Painting Surface");
@@ -1707,6 +2892,7 @@ public class SimulationUIController : MonoBehaviour
         CreateColorButton(row, "Red", new Color(0.9f, 0.08f, 0.04f, 1f));
         CreateColorButton(row, "Yellow", new Color(1f, 0.82f, 0.08f, 1f));
         CreateColorButton(row, "Green", new Color(0.05f, 0.7f, 0.25f, 1f));
+        CreateColorButton(row, "White", Color.white);
     }
 
     private void CreateColorButton(Transform parent, string label, Color color)
@@ -1714,12 +2900,70 @@ public class SimulationUIController : MonoBehaviour
         Button button = CreateButton(parent, label, () =>
         {
             paintColor = color;
+            if (paintReservoir != null)
+            {
+                paintReservoir.SetSelectedColor(color);
+            }
             ApplyExtendedSettings(false);
+            SyncLegacyPaintPreview();
         });
         Image image = button.GetComponent<Image>();
         if (image != null)
         {
             image.color = color;
+        }
+    }
+
+    private void AddCurrentColorToBucket()
+    {
+        if (paintReservoir == null)
+        {
+            userMessage = "Paint reservoir is missing.";
+            return;
+        }
+
+        float amount = Mathf.Max(0.001f, paintEmitter != null ? paintEmitter.remainingPaintAmount : initialPaintAmount);
+        paintReservoir.AddColorToBucket(paintColor, amount);
+        SyncLegacyPaintPreview();
+        userMessage = "Added color #" + ColorUtility.ToHtmlStringRGB(paintColor) + " to bucket.";
+    }
+
+    private void ClearBucketColors()
+    {
+        if (paintReservoir == null)
+        {
+            userMessage = "Paint reservoir is missing.";
+            return;
+        }
+
+        paintReservoir.ClearColors();
+        SyncLegacyPaintPreview();
+        userMessage = "Bucket color components cleared.";
+    }
+
+    private void DrawPaintModeTest(PaintingSurface.TrailRenderMode mode)
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "PaintingSurface is missing.";
+            return;
+        }
+
+        Color testColor = paintReservoir != null ? paintReservoir.VisiblePaintColor : paintColor;
+        if (mode == PaintingSurface.TrailRenderMode.Dots)
+        {
+            paintingSurface.DrawTestDots(testColor);
+            userMessage = "Direct drawing test: Dots.";
+        }
+        else if (mode == PaintingSurface.TrailRenderMode.Trails)
+        {
+            paintingSurface.DrawTestTrails(testColor);
+            userMessage = "Direct drawing test: Trails.";
+        }
+        else
+        {
+            paintingSurface.DrawTestRibbon(testColor);
+            userMessage = "Direct drawing test: Ribbon.";
         }
     }
 
@@ -1737,6 +2981,11 @@ public class SimulationUIController : MonoBehaviour
     private string FormatVector3(Vector3 value)
     {
         return value.x.ToString("0.00") + ", " + value.y.ToString("0.00") + ", " + value.z.ToString("0.00");
+    }
+
+    private string FormatColor(Color value)
+    {
+        return value.r.ToString("0.00") + ", " + value.g.ToString("0.00") + ", " + value.b.ToString("0.00") + ", " + value.a.ToString("0.00");
     }
 
     private void SetPreferredHeight(RectTransform rectTransform, float height)
@@ -1793,6 +3042,20 @@ public class SimulationUIController : MonoBehaviour
         UpdateResultTexts();
     }
 
+    private void ClearWorldPaint()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        paintingSurface.ClearWorldPaint();
+        userMessage = "World paint cleared.";
+        UpdateCanvasStatusText();
+        UpdateResultTexts();
+    }
+
     private void DrawUvMappingTest()
     {
         if (paintingSurface == null)
@@ -1803,6 +3066,93 @@ public class SimulationUIController : MonoBehaviour
 
         paintingSurface.DrawMappingTestPattern();
         userMessage = "UV mapping test pattern drawn.";
+        UpdateCanvasStatusText();
+    }
+
+    private void DrawWorldHitMappingTest()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        paintingSurface.DrawWorldHitMappingTest();
+        userMessage = "World hit mapping test pattern drawn.";
+        UpdateCanvasStatusText();
+    }
+
+    private void TestParticleBoardCollision()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        bool deposited = paintingSurface.TestParticleBoardCollision();
+        userMessage = deposited
+            ? "Test particle collision deposited at the board hit point."
+            : "Test particle collision missed the board.";
+        UpdateCanvasStatusText();
+        UpdateResultTexts();
+    }
+
+    private void DrawVisibleWorldPaintTest()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        paintingSurface.DrawVisibleWorldPaintTest();
+        userMessage = "Visible world paint test drawn.";
+        UpdateCanvasStatusText();
+    }
+
+    private void PaintUnderBucketTest()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        Transform bucketTransform = pendulumController != null
+            ? pendulumController.transform
+            : paintExitPoint != null
+                ? paintExitPoint
+                : paintEmitter != null
+                    ? paintEmitter.transform
+                    : null;
+
+        if (bucketTransform == null)
+        {
+            userMessage = "Bucket transform is missing.";
+            return;
+        }
+
+        bool deposited = paintingSurface.PaintUnderBucketTest(bucketTransform.position);
+        userMessage = deposited
+            ? "Paint under bucket test drawn."
+            : "Bucket projection is outside the board.";
+        UpdateCanvasStatusText();
+    }
+
+    private void AutoTryEightMappingModes()
+    {
+        if (paintingSurface == null)
+        {
+            userMessage = "Painting surface is missing.";
+            return;
+        }
+
+        paintingSurface.AutoTryNextMappingMode();
+        userMessage = "Mapping mode: " + paintingSurface.mappingPlane +
+            ", invert right " + (paintingSurface.invertRightAxis ? "On" : "Off") +
+            ", invert up " + (paintingSurface.invertUpAxis ? "On" : "Off") +
+            ", swap " + (paintingSurface.swapAxes ? "On" : "Off") + ".";
         UpdateCanvasStatusText();
     }
 
@@ -1832,6 +3182,7 @@ public class SimulationUIController : MonoBehaviour
             return;
         }
 
+        SyncExperimentRequirementFields();
         PaintExperimentManager.ExperimentRecord record = experimentManager.SaveExperiment(simulationTime);
         userMessage = "Saved " + record.experimentName;
         if (lastImagePathText != null)
@@ -1867,6 +3218,7 @@ public class SimulationUIController : MonoBehaviour
             return;
         }
 
+        SyncExperimentRequirementFields();
         string path = experimentManager.GenerateReport(simulationTime);
         userMessage = string.IsNullOrEmpty(path) ? "Report generation failed." : "Report generated.";
         if (lastReportPathText != null)
@@ -1886,10 +3238,10 @@ public class SimulationUIController : MonoBehaviour
 
         bool wasPaused = isPaused;
         SetFluidPaused(true);
-        fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
+        SyncLegacyPaintPreview();
         fluidSimulation.ApplyParticlePreset(preset);
         fluidSimulation.ResetFluid();
-        fluidSimulation.SetLegacyFluidParticlesVisible(showLegacyFluidParticles);
+        SyncLegacyPaintPreview();
         SetFluidPaused(wasPaused);
         userMessage = "Particle preset: " + fluidSimulation.particlePreset;
         if (activeTab == DashboardTab.Performance)
@@ -1899,12 +3251,166 @@ public class SimulationUIController : MonoBehaviour
         UpdateResultTexts();
     }
 
+    private void EnsureFluidPreview()
+    {
+        if (fluidPreview != null)
+        {
+            SyncIndependentFluidPreviewColor();
+            return;
+        }
+
+        GameObject previewObject = GameObject.Find("IndependentFluidPreview");
+        if (previewObject == null)
+        {
+            previewObject = new GameObject("IndependentFluidPreview");
+        }
+
+        fluidPreview = previewObject.GetComponent<IndependentFluidVisualizer>();
+        if (fluidPreview == null)
+        {
+            fluidPreview = previewObject.AddComponent<IndependentFluidVisualizer>();
+        }
+        fluidPreview.pendulumController = pendulumController;
+        fluidPreview.paintReservoir = paintReservoir;
+        fluidPreview.paintEmitter = paintEmitter;
+        SyncIndependentFluidPreviewColor();
+    }
+
+    private void ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset preset)
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ApplyPreset(preset);
+        userMessage = "Fluid preview preset: " + preset + " (" + fluidPreview.previewParticleCount.ToString("N0") + " particles).";
+        if (activeTab == DashboardTab.FluidPreview)
+        {
+            RebuildActiveTab();
+        }
+    }
+
+    private void ForceRebuildFluidPreviewParticles()
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ForceRebuildParticles();
+        userMessage = "Fluid preview particles rebuilt (" + fluidPreview.VisibleParticleCount.ToString("N0") + " visible).";
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void ForceRebuildFluidPreview()
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ForceRebuildPreview();
+        userMessage = "Fluid preview rebuilt with current box and visual settings.";
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void ResetFluidPreviewBoxTransform()
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ResetBoxTransform();
+        userMessage = "Fluid preview box transform reset.";
+        if (activeTab == DashboardTab.FluidPreview)
+        {
+            RebuildActiveTab();
+        }
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void ResetFluidPreviewVisuals()
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ResetPreviewVisuals();
+        userMessage = "Fluid preview visuals reset.";
+        if (activeTab == DashboardTab.FluidPreview)
+        {
+            RebuildActiveTab();
+        }
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void ResetFluidPreviewLiquidCalibration()
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ResetLiquidCalibration();
+        userMessage = "Fluid preview liquid calibration reset.";
+        if (activeTab == DashboardTab.FluidPreview)
+        {
+            RebuildActiveTab();
+        }
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void ResetFluidPreviewMotion()
+    {
+        EnsureFluidPreview();
+        if (fluidPreview == null)
+        {
+            userMessage = "Fluid preview is missing.";
+            return;
+        }
+
+        fluidPreview.ResetPreviewMotion();
+        userMessage = "Fluid preview motion reset.";
+        UpdateUnifiedCanvasTexts();
+    }
+
+    private void SyncExperimentRequirementFields()
+    {
+        if (experimentManager == null)
+        {
+            return;
+        }
+
+        experimentManager.bucketRadius = bucketRadius;
+        experimentManager.pivotPosition = pivotPosition;
+        experimentManager.swingDirectionDegrees = swingDirectionDegrees;
+        experimentManager.targetSwingCount = unlimitedSwings ? 0 : targetSwingCount;
+        experimentManager.completedSwingCount = swingCount;
+        experimentManager.swingTargetCompleted = targetSwingCompleted;
+    }
+
     private void UpdateUnifiedCanvasTexts()
     {
         if (topStatusText != null)
         {
+            float capacity = paintReservoir != null ? paintReservoir.capacity : paintCapacity;
             float remainingPercent = paintEmitter != null
-                ? Mathf.Clamp01(paintEmitter.remainingPaintAmount / Mathf.Max(0.001f, paintEmitter.initialPaintAmount)) * 100f
+                ? Mathf.Clamp01(paintEmitter.remainingPaintAmount / Mathf.Max(0.001f, capacity)) * 100f
                 : 0f;
             int particleCount = fluidSimulation != null ? fluidSimulation.currentParticleCount : 0;
             string preset = fluidSimulation != null ? fluidSimulation.particlePreset.ToString() : "-";
@@ -1912,6 +3418,8 @@ public class SimulationUIController : MonoBehaviour
             float flow = paintEmitter != null ? paintEmitter.CurrentFlowRateKgPerSecond : 0f;
             int marks = paintingSurface != null ? paintingSurface.MarkCount : 0;
             float area = paintingSurface != null ? paintingSurface.EstimatedPaintedArea01 * 100f : 0f;
+            string bucketState = paintEmitter != null ? paintEmitter.BucketState : "-";
+            string legacyState = fluidSimulation != null ? fluidSimulation.LegacyPreviewState : "-";
 
             topStatusText.text =
                 "Status: " + statusText +
@@ -1921,7 +3429,10 @@ public class SimulationUIController : MonoBehaviour
                 "    Preset: " + preset +
                 "    Buffers: " + bufferMb.ToString("0.0") + " MB" +
                 "    Paint: " + remainingPercent.ToString("0") + "%" +
+                "    Swings: " + swingCount + "/" + (unlimitedSwings ? "Unlimited" : targetSwingCount.ToString()) +
+                "    Bucket: " + bucketState +
                 "    Flow: " + flow.ToString("0.0000") + " kg/s" +
+                "    Legacy: " + legacyState +
                 "    Marks: " + marks +
                 "    Area: " + area.ToString("0.0") + "%";
         }
@@ -1934,6 +3445,28 @@ public class SimulationUIController : MonoBehaviour
         if (mouseCameraDebugText != null)
         {
             mouseCameraDebugText.text = BuildMouseCameraDebugText();
+        }
+
+        if (mouseGrabDebugText != null)
+        {
+            mouseGrabDebugText.text = BuildMouseGrabDebugText();
+        }
+
+        SyncMotionSlidersAfterMouseGrab();
+
+        if (ropeDebugText != null)
+        {
+            ropeDebugText.text = BuildRopeDebugText();
+        }
+
+        if (paintStatusText != null)
+        {
+            paintStatusText.text = BuildPaintStatusText();
+        }
+
+        if (fluidPreviewStatsText != null)
+        {
+            fluidPreviewStatsText.text = fluidPreview != null ? fluidPreview.StatsText : "Fluid preview missing.";
         }
 
         UpdateCanvasStatusText();
@@ -1986,6 +3519,173 @@ public class SimulationUIController : MonoBehaviour
             "\nCurrent target: " + mouseCameraController.currentTargetName;
     }
 
+    private string BuildMouseGrabDebugText()
+    {
+        if (mouseGrabController == null)
+        {
+            return "Mouse Grab: Missing";
+        }
+
+        return mouseGrabController.DebugSummary;
+    }
+
+    private void SyncMotionSlidersAfterMouseGrab()
+    {
+        if (mouseGrabController == null || pendulumController == null)
+        {
+            return;
+        }
+
+        if (mouseGrabController.currentState == MouseGrabController.GrabState.Dragging ||
+            mouseGrabController.currentState == MouseGrabController.GrabState.Released)
+        {
+            SetSliderValueWithoutNotify(initialAngleSlider, pendulumController.theta * Mathf.Rad2Deg);
+            SetSliderValueWithoutNotify(sidePushSlider, pendulumController.phiDot);
+        }
+    }
+
+    private string BuildRopeDebugText()
+    {
+        if (ropeController == null)
+        {
+            return "Rope type: Mass-Spring Rope\nRope component missing.";
+        }
+
+        int segments = Mathf.Max(0, ropeController.nodeCount - 1);
+        string bucketDebug = pendulumController != null
+            ? "\nRope Length: " + pendulumController.ropeLength.ToString("0.000") +
+              "\nActual Pivot-To-Attach Distance: " + pendulumController.actualPivotToAttachDistance.ToString("0.000") +
+              "\nDistance Error: " + pendulumController.pivotAttachDistanceError.ToString("0.0000") +
+              "\nPivot Position: " + FormatVector3(pendulumController.debugPivotPosition) +
+              "\nAttach Position: " + FormatVector3(pendulumController.debugAttachPosition) +
+              "\nBucket Position: " + FormatVector3(pendulumController.debugBucketPosition) +
+              "\nBucket Visual Offset: " + FormatVector3(pendulumController.debugBucketVisualOffset) +
+              "\nShow Bucket Debug: " + (pendulumController.showBucketDebug ? "On" : "Off")
+            : "\nBucket attachment debug: Pendulum missing";
+        return
+            "Rope type: " + ropeController.ropeType +
+            "\nSegment count: " + segments +
+            "\nNode count: " + ropeController.nodeCount +
+            "\nSpring stiffness: " + ropeController.stiffness.ToString("0") +
+            "\nRope damping: " + ropeController.springDamping.ToString("0") +
+            "\nRope flexibility: " + ropeController.bendAmount.ToString("0.00") +
+            "\nConstraint iterations: " + ropeController.lengthCorrectionIterations +
+            "\nBucket Weight: " + bucketWeight.ToString("0.00") + " kg" +
+            "\nBucket Radius: " + bucketRadius.ToString("0.00") + " m" +
+            bucketDebug +
+            "\nSwing Direction: " + swingDirectionDegrees.ToString("0") + " deg" +
+            "\nTarget Swings: " + (unlimitedSwings ? "Unlimited" : targetSwingCount.ToString()) +
+            "\nCompleted Swings: " + swingCount +
+            "\nSwing Target Completed: " + (targetSwingCompleted ? "Yes" : "No") +
+            "\nMass Response Scale: " + (pendulumController != null ? pendulumController.massResponseScale.ToString("0.00") : "-") +
+            "\nCurrent average stretch: " + ropeController.currentAverageStretch.ToString("0.0000") + " m" +
+            "\nAverage stretch percent: " + ropeController.currentAverageStretchPercent.ToString("0.00") + "%";
+    }
+
+    private string BuildPaintStatusText()
+    {
+        float remaining = paintEmitter != null ? paintEmitter.remainingPaintAmount : initialPaintAmount;
+        float initial = paintEmitter != null ? paintEmitter.initialPaintAmount : initialPaintAmount;
+        float capacity = paintReservoir != null ? paintReservoir.capacity : paintCapacity;
+        float fillPercent = paintReservoir != null ? paintReservoir.FillPercent * 100f : Mathf.Clamp01(remaining / Mathf.Max(0.001f, capacity)) * 100f;
+        float flow = paintEmitter != null ? paintEmitter.CurrentFlowRateKgPerSecond : 0f;
+        float emittedMassThisFrame = paintEmitter != null ? paintEmitter.LastEmittedMassThisFrame : 0f;
+        float reservoirCurrentAmount = paintReservoir != null ? paintReservoir.currentPaintAmount : 0f;
+        float particlesPerSecond = paintEmitter != null ? paintEmitter.CurrentParticlesPerSecond : 0f;
+        float effectiveRadius = paintingSurface != null
+            ? paintingSurface.GetEffectivePaintDepositRadius(holeDiameter, viscosity, Mathf.Max(0f, exitSpeed), paintingSurface.CurrentSurfaceBehavior, paintingSurface.strokeRadius)
+            : 0f;
+        int activeAirborne = paintEmitter != null ? paintEmitter.ActiveAirborneParticleCount : 0;
+        int deposited = paintEmitter != null ? paintEmitter.DepositedParticleCount : 0;
+        int recycled = paintEmitter != null ? paintEmitter.RecycledParticleCount : 0;
+        int missed = paintEmitter != null ? paintEmitter.MissedBoardParticleCount : 0;
+        int collisions = paintEmitter != null ? paintEmitter.TotalCollisionCount : 0;
+        int recycledAfterHit = paintEmitter != null ? paintEmitter.RecycledAfterHitCount : 0;
+        string bucketState = paintEmitter != null ? paintEmitter.BucketState : "Full";
+        if (paintReservoir != null)
+        {
+            bucketState = paintReservoir.BucketState;
+        }
+        string legacyState = fluidSimulation != null ? fluidSimulation.LegacyPreviewState : "Hidden";
+        string uiMode = trailModeDropdown != null
+            ? ((PaintingSurface.TrailRenderMode)Mathf.Clamp(trailModeDropdown.value, 0, 2)).ToString()
+            : "No UI";
+        string surfaceMode = paintingSurface != null ? paintingSurface.ActiveTrailMode.ToString() : "No Surface";
+        string emitterMode = paintEmitter != null ? paintEmitter.ActiveDepositMode : "No Emitter";
+        string lastDepositMode = paintingSurface != null ? paintingSurface.LastDepositModeUsed : "None";
+        int totalDeposits = paintingSurface != null ? paintingSurface.TotalDepositCount : 0;
+        int textureUpdates = paintingSurface != null ? paintingSurface.TextureUpdatedCount : 0;
+        int connectedStrokes = paintingSurface != null ? paintingSurface.ConnectedStrokeCount : 0;
+        int rejectedConnections = paintingSurface != null ? paintingSurface.RejectedConnectionCount : 0;
+        int activeStrokes = paintingSurface != null ? paintingSurface.ActiveStreamCount : 0;
+        Vector2 lastHitUv = paintingSurface != null ? paintingSurface.LastHitUv : Vector2.zero;
+        Vector2 lastHitPixel = paintingSurface != null ? paintingSurface.LastPixelHit : Vector2.zero;
+        bool modeMismatch = paintingSurface != null && (
+            (trailModeDropdown != null && uiMode != surfaceMode) ||
+            (paintEmitter != null && emitterMode != surfaceMode)
+        );
+        Color mixedColor = paintReservoir != null ? paintReservoir.mixedPaintColor : paintColor;
+        string mixMode = paintReservoir != null ? paintReservoir.mixMode.ToString() : "SingleColor";
+        string components = paintReservoir != null ? paintReservoir.ColorComponentsSummary : "#" + ColorUtility.ToHtmlStringRGB(paintColor);
+        string reservoirDebug = paintReservoir != null
+            ? paintReservoir.LiquidDebugSummary
+            : "Reservoir component found: No";
+        bool highFlow = emissionRate > 50f;
+        bool blobRisk = effectiveRadius > 0.018f || emissionRate > 50f || particlesPerSecond > 180f;
+        string blobWarning = highFlow
+            ? "High flow may create large blobs."
+            : blobRisk
+                ? "Blob Warning: radius or particle flow is high."
+                : "Blob Warning: none.";
+
+        return
+            "Selected Paint Color: #" + ColorUtility.ToHtmlStringRGB(paintColor) +
+            "\nMixed Color: #" + ColorUtility.ToHtmlStringRGB(mixedColor) +
+            "\nMix Mode: " + mixMode +
+            "\nPaint Capacity: " + capacity.ToString("0.000") + " kg" +
+            "\nInitial Paint Slider: " + initialPaintAmount.ToString("0.000") + " kg" +
+            "\nRemaining Paint: " + remaining.ToString("0.000") + " / " + Mathf.Max(0f, capacity).ToString("0.000") + " kg" +
+            "\nHole Diameter: " + holeDiameter.ToString("0.000") + " m" +
+            "\nEffective Deposit Radius: " + effectiveRadius.ToString("0.000") + " m" +
+            "\nStroke Radius Multiplier: " + (paintingSurface != null ? paintingSurface.strokeRadius.ToString("0.00") : "1.00") +
+            "\nFlow Multiplier: " + emissionRate.ToString("0") + (advancedPaintMode ? " (Advanced)" : "") +
+            "\nFill Percent: " + fillPercent.ToString("0.0") + "%" +
+            "\nFlow Rate: " + flow.ToString("0.0000") + " kg/s" +
+            "\nDebug Emitted Mass This Frame: " + emittedMassThisFrame.ToString("0.000000") + " kg" +
+            "\nDebug Reservoir Current Amount: " + reservoirCurrentAmount.ToString("0.000000") + " kg" +
+            "\nParticles Per Second: " + particlesPerSecond.ToString("0") +
+            "\n" + blobWarning +
+            "\nBucket State: " + bucketState +
+            "\nActive Airborne Particles: " + activeAirborne +
+            "\nDeposited Total: " + deposited +
+            "\nRecycled Total: " + recycled +
+            "\nPaintingSurface found: " + (paintEmitter != null && paintEmitter.HasPaintingSurface ? "yes" : "no") +
+            "\nLast dPrev: " + (paintingSurface != null ? paintingSurface.LastCollisionDPrev.ToString("0.0000") : "-") +
+            "\nLast dCurr: " + (paintingSurface != null ? paintingSurface.LastCollisionDCurr.ToString("0.0000") : "-") +
+            "\nLast t: " + (paintingSurface != null ? paintingSurface.LastCollisionT.ToString("0.000") : "-") +
+            "\nLast hit inside board: " + (paintingSurface != null && paintingSurface.LastHitInsideBoard ? "yes" : "no") +
+            "\nLast hit world position: " + (paintingSurface != null ? FormatVector3(paintingSurface.LastCollisionWorldPosition) : "-") +
+            "\nTotal collisions: " + collisions +
+            "\nTotal missed board: " + missed +
+            "\nTotal recycled after hit: " + recycledAfterHit +
+            "\nStream clipped by board: " + (paintEmitter != null && paintEmitter.LastStreamClippedByBoard ? "yes" : "no") +
+            "\nLegacy Preview: " + legacyState +
+            "\nUI Selected Mode: " + uiMode +
+            "\nPaintingSurface Active Mode: " + surfaceMode +
+            "\nPaintParticleEmitter Active Mode: " + emitterMode +
+            "\nLast Deposit Mode: " + lastDepositMode +
+            "\nTotal Deposits: " + totalDeposits +
+            "\nTexture Updated Count: " + textureUpdates +
+            "\nLast Hit UV: " + lastHitUv.x.ToString("0.000") + ", " + lastHitUv.y.ToString("0.000") +
+            "\nLast Hit Pixel: " + lastHitPixel.x.ToString("0") + ", " + lastHitPixel.y.ToString("0") +
+            "\nConnected Strokes: " + connectedStrokes +
+            "\nRejected Connections: " + rejectedConnections +
+            "\nActive Stroke Count: " + activeStrokes +
+            (modeMismatch ? "\nWARNING: Paint mode source-of-truth mismatch." : "") +
+            "\nColor Components: " + components +
+            "\n\n" + reservoirDebug;
+    }
+
     private void UpdateCanvasStatusText()
     {
         if (canvasStatusText == null)
@@ -2003,6 +3703,9 @@ public class SimulationUIController : MonoBehaviour
         Vector3 scale = paintingSurface.BoardScale;
         int airborne = paintEmitter != null ? paintEmitter.ActiveAirborneParticleCount : 0;
         int deposited = paintEmitter != null ? paintEmitter.DepositedParticleCount : 0;
+        int depositedThisFrame = paintEmitter != null ? paintEmitter.DepositedThisFrameCount : 0;
+        int recycled = paintEmitter != null ? paintEmitter.RecycledParticleCount : 0;
+        int missed = paintEmitter != null ? paintEmitter.MissedBoardParticleCount : 0;
         PaintingSurface.SurfaceBehavior behavior = paintingSurface.CurrentSurfaceBehavior;
         canvasStatusText.text =
             "Canvas Width: " + paintingSurface.currentWidth.ToString("0.0") +
@@ -2011,6 +3714,33 @@ public class SimulationUIController : MonoBehaviour
             "\nOrientation: " + paintingSurface.orientation +
             "\nTilt Angle slider: " + canvasTiltDegrees.ToString("0") + " deg" +
             "\nApplied Tilt Angle: " + paintingSurface.tiltAngle.ToString("0") + " deg" +
+            "\nPaint Render Mode: " + paintingSurface.paintRenderMode +
+            "\nWorld Paint Renderer:" +
+            "\nRender Mode: " + paintingSurface.paintRenderMode +
+            "\nWorld Paint Draw Calls: " + paintingSurface.WorldPaintDrawCalls +
+            "\nPaint Objects Count: " + paintingSurface.WorldPaintObjectCount +
+            "\nLast Paint Object Position: " + FormatVector3(paintingSurface.LastPaintObjectPosition) +
+            "\nLast Paint Radius: " + paintingSurface.LastPaintRadius.ToString("0.000") +
+            "\nLast Paint Alpha: " + paintingSurface.LastPaintAlpha.ToString("0.000") +
+            "\nLast Paint Material Color: " + FormatColor(paintingSurface.LastPaintMaterialColor) +
+            "\nPaint Surface Offset: " + paintingSurface.ActivePaintSurfaceOffset.ToString("0.000") +
+            "\nInvert Paint Normal: " + paintingSurface.invertPaintNormal +
+            "\nInvert Collision Normal: " + paintingSurface.invertBoardNormalForCollision +
+            "\nAlways Visible Debug: " + paintingSurface.paintDecalsAlwaysVisibleDebug +
+            "\nFallback Geometry: " + paintingSurface.worldPaintFallbackGeometry +
+            "\nVisible Paint Normal: " + FormatVector3(paintingSurface.LastVisiblePaintNormal) +
+            "\nRenderer Diagnostic:\n" + paintingSurface.WorldPaintRendererDiagnostic +
+            "\nMapping Plane: " + paintingSurface.mappingPlane +
+            "\nboardRightAxis: " + FormatVector3(paintingSurface.BoardRightAxis) +
+            "\nboardUpAxis: " + FormatVector3(paintingSurface.BoardUpAxis) +
+            "\nboardNormal: " + FormatVector3(paintingSurface.BoardNormal) +
+            "\ncollisionNormal: " + FormatVector3(paintingSurface.invertBoardNormalForCollision ? -paintingSurface.BoardNormal : paintingSurface.BoardNormal) +
+            "\ninvertRightAxis: " + paintingSurface.invertRightAxis +
+            "\ninvertUpAxis: " + paintingSurface.invertUpAxis +
+            "\nswapAxes: " + paintingSurface.swapAxes +
+            "\nshowHitDebugMarkers: " + paintingSurface.showMappingDebugMarkers +
+            "\nmarkerHistory: " + paintingSurface.debugMarkerHistoryMode +
+            "\n" + paintingSurface.MappingDebugSummary +
             "\nAbsorption: " + behavior.absorption.ToString("0.00") +
             "\nSpread Multiplier: " + behavior.spreadMultiplier.ToString("0.00") +
             "\nFriction: " + behavior.friction.ToString("0.00") +
@@ -2018,19 +3748,39 @@ public class SimulationUIController : MonoBehaviour
             "\nFlow Down Slope: " + behavior.flowDownSlope.ToString("0.00") +
             "\nLast impact speed: " + paintingSurface.LastImpactSpeed.ToString("0.00") + " m/s" +
             "\nAirborne particles: " + airborne +
+            "\nDeposited this frame: " + depositedThisFrame +
             "\nDeposited particles: " + deposited +
-            "\nTrail mode: " + paintingSurface.trailMode +
+            "\nRecycled particles: " + recycled +
+            "\nMissed board particles: " + missed +
+            "\nTotal missed board: " + missed +
+            "\nPaintingSurface found: " + (paintEmitter != null && paintEmitter.HasPaintingSurface ? "yes" : "no") +
+            "\nLast dPrev: " + paintingSurface.LastCollisionDPrev.ToString("0.0000") +
+            "\nLast dCurr: " + paintingSurface.LastCollisionDCurr.ToString("0.0000") +
+            "\nLast t: " + paintingSurface.LastCollisionT.ToString("0.000") +
+            "\nLast hit inside board: " + (paintingSurface.LastHitInsideBoard ? "yes" : "no") +
+            "\nLast hit world position: " + FormatVector3(paintingSurface.LastCollisionWorldPosition) +
+            "\nTotal collisions: " + (paintEmitter != null ? paintEmitter.TotalCollisionCount : 0) +
+            "\nTotal recycled after hit: " + (paintEmitter != null ? paintEmitter.RecycledAfterHitCount : 0) +
+            "\nStream clipped by board: " + (paintEmitter != null && paintEmitter.LastStreamClippedByBoard ? "yes" : "no") +
+            "\nShow airborne particles: " + (paintEmitter != null && paintEmitter.showAirborneParticles ? "On" : "Off") +
+            "\nTrail mode: " + paintingSurface.ActiveTrailMode +
+            "\nLast deposit mode: " + paintingSurface.LastDepositModeUsed +
+            "\nTotal deposits: " + paintingSurface.TotalDepositCount +
+            "\nTexture updated count: " + paintingSurface.TextureUpdatedCount +
             "\nConnected strokes: " + paintingSurface.ConnectedStrokeCount +
             "\nRejected connections: " + paintingSurface.RejectedConnectionCount +
             "\nAverage stroke length: " + paintingSurface.AverageStrokeLength.ToString("0.0") + " px" +
             "\nActive streams: " + paintingSurface.ActiveStreamCount +
             "\nLast hit UV: " + paintingSurface.LastHitUv.x.ToString("0.000") + ", " + paintingSurface.LastHitUv.y.ToString("0.000") +
             "\nCurrent hit UV: " + paintingSurface.CurrentHitUv.x.ToString("0.000") + ", " + paintingSurface.CurrentHitUv.y.ToString("0.000") +
-            "\nWorld hit: " + FormatVector3(paintingSurface.LastWorldHit) +
+            "\nparticle previousPosition: " + FormatVector3(paintingSurface.LastParticlePreviousPosition) +
+            "\nparticle currentPosition: " + FormatVector3(paintingSurface.LastParticleCurrentPosition) +
+            "\nlastWorldHit: " + FormatVector3(paintingSurface.LastWorldHit) +
+            "\nlastUV: " + paintingSurface.LastHitUv.x.ToString("0.000") + ", " + paintingSurface.LastHitUv.y.ToString("0.000") +
             "\nLocal hit: " + FormatVector3(paintingSurface.LastLocalHit) +
-            "\nPixel hit: " + paintingSurface.LastPixelHit.x.ToString("0") + ", " + paintingSurface.LastPixelHit.y.ToString("0") +
+            "\nlastPixel: " + paintingSurface.LastPixelHit.x.ToString("0") + ", " + paintingSurface.LastPixelHit.y.ToString("0") +
             "\nUV world check: " + FormatVector3(paintingSurface.LastUvToWorldCheck) +
-            "\nMapping error: " + paintingSurface.MappingErrorDistance.ToString("0.0000") + " m" +
+            "\nuvToWorldError: " + paintingSurface.MappingErrorDistance.ToString("0.0000") + " m" +
             "\nConnect distance: " + paintingSurface.connectDistanceThreshold.ToString("0.000") +
             "\nPainted area: " + (paintingSurface.EstimatedPaintedArea01 * 100f).ToString("0.0") + "%" +
             "\nAverage wetness: " + paintingSurface.AverageWetness.ToString("0.000") +
@@ -2096,6 +3846,57 @@ public class SimulationUIController : MonoBehaviour
         GUILayout.Label("Flow: " + (paintEmitter != null ? paintEmitter.CurrentFlowRateKgPerSecond.ToString("0.0000") : "0") + " kg/s");
         GUILayout.Label("Marks: " + (paintingSurface != null ? paintingSurface.MarkCount.ToString() : "0"));
 
+        EnsureFluidPreview();
+        if (fluidPreview != null)
+        {
+            GUILayout.Label("Standalone Fluid Preview");
+            fluidPreview.showPreview = GUILayout.Toggle(fluidPreview.showPreview, "Show Fluid Preview");
+            if (GUILayout.Button("Preview Mode: " + (fluidPreview.IsFollowMode ? "Follow Bucket Liquid" : "Manual Debug")))
+            {
+                fluidPreview.previewMode = fluidPreview.IsFollowMode
+                    ? IndependentFluidVisualizer.PreviewMode.ManualDebug
+                    : IndependentFluidVisualizer.PreviewMode.FollowBucketLiquid;
+            }
+            fluidPreview.showInternalParticles = GUILayout.Toggle(fluidPreview.showInternalParticles, "Show Internal Particles");
+            fluidPreview.showDensityColors = GUILayout.Toggle(fluidPreview.showDensityColors, "Show Density Colors");
+            fluidPreview.showCollisionFlashes = GUILayout.Toggle(fluidPreview.showCollisionFlashes, "Show Collision Flashes");
+            fluidPreview.showFlowLayers = GUILayout.Toggle(fluidPreview.showFlowLayers, "Show Flow Layers");
+            fluidPreview.showParticleCountProof = GUILayout.Toggle(fluidPreview.showParticleCountProof, "Show Particle Count Proof");
+            if (GUILayout.Button("Preview Render Mode: " + fluidPreview.previewRenderMode))
+            {
+                int nextMode = ((int)fluidPreview.previewRenderMode + 1) % 3;
+                fluidPreview.previewRenderMode = (IndependentFluidVisualizer.PreviewRenderMode)nextMode;
+                fluidPreview.ForceRebuildParticles();
+            }
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Low 8k")) ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.Low);
+            if (GUILayout.Button("Medium 50k")) ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.Medium);
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("High 200k")) ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.High);
+            if (GUILayout.Button("Ultra 1M")) ApplyFluidPreviewPreset(IndependentFluidVisualizer.ParticlePreset.Ultra);
+            GUILayout.EndHorizontal();
+            if (GUILayout.Button("Force Rebuild Preview Particles")) ForceRebuildFluidPreviewParticles();
+            if (fluidPreview.previewMode == IndependentFluidVisualizer.PreviewMode.ManualDebug)
+            {
+                float fill = fluidPreview.fillPercent * 100f;
+                DrawSlider("Preview Fill Percent", ref fill, 5f, 100f);
+                fluidPreview.fillPercent = Mathf.Clamp01(fill / 100f);
+                float count = fluidPreview.previewParticleCount;
+                DrawSlider("Preview Particle Count", ref count, 25f, 1000000f);
+                int roundedCount = Mathf.RoundToInt(count);
+                if (roundedCount != fluidPreview.previewParticleCount)
+                {
+                    fluidPreview.SetPreviewParticleCount(roundedCount);
+                }
+                DrawSlider("Preview Slosh Strength", ref fluidPreview.sloshStrength, 0f, 1.5f);
+                DrawSlider("Preview Motion Speed", ref fluidPreview.motionSpeed, 0.1f, 5f);
+                DrawSlider("Preview Slosh Damping", ref fluidPreview.sloshDamping, 0.1f, 8f);
+            }
+            if (GUILayout.Button("Reset Preview Motion")) ResetFluidPreviewMotion();
+            GUILayout.TextArea(fluidPreview.StatsText, GUILayout.MinHeight(110));
+        }
+
         GUILayout.Label("Particle Count Presets");
         GUILayout.BeginHorizontal();
         DrawParticlePresetButton("Low 8k", Simulation3D.ParticleCountPreset.Low);
@@ -2107,8 +3908,8 @@ public class SimulationUIController : MonoBehaviour
         GUILayout.EndHorizontal();
 
         DrawSlider("Bucket Weight kg", ref bucketWeight, 0.2f, 10f);
-        DrawSlider("Initial Paint kg", ref initialPaintAmount, 0.1f, 5f);
-        DrawSlider("Bucket Radius m", ref bucketRadius, 0.2f, 1.2f);
+        DrawSlider("Initial Paint kg", ref initialPaintAmount, 0.1f, 100f);
+        DrawSlider("Bucket Radius m", ref bucketRadius, 0.15f, 1.0f);
         DrawSlider("Hole Diameter m", ref holeDiameter, 0.01f, 0.25f);
         DrawSlider("Rope Flexibility", ref ropeFlexibility, 0f, 1f);
         DrawSlider("Humidity", ref humidity, 0f, 1f);

@@ -12,11 +12,14 @@ public struct SpringRopeNode
 [RequireComponent(typeof(LineRenderer))]
 public class MassSpringRope : MonoBehaviour
 {
+    public const string RopeModelName = "Mass-Spring Rope";
+
     [Header("References")]
     public Transform pivotPoint;
     public Transform ropeAttachPoint;
 
     [Header("Rope Settings")]
+    public string ropeType = RopeModelName;
     public float ropeLength = 4.1f;
     public int nodeCount = 45;
 
@@ -56,6 +59,11 @@ public class MassSpringRope : MonoBehaviour
     [Range(0f, 1f)]
     public float bendAmount = 0.18f;
 
+    [Header("Debug - Mass-Spring")]
+    public float currentAverageStretch;
+    public float currentMaxStretch;
+    public float currentAverageStretchPercent;
+
     [Header("Visual")]
     public float ropeWidth = 0.045f;
     public Material ropeMaterial;
@@ -67,6 +75,7 @@ public class MassSpringRope : MonoBehaviour
     private LineRenderer lineRenderer;
     private float restLength;
     private bool initialized;
+    private int previousNodeCount;
 
     private void Awake()
     {
@@ -82,6 +91,7 @@ public class MassSpringRope : MonoBehaviour
     {
         ropeLength = Mathf.Max(0.1f, ropeLength);
         nodeCount = Mathf.Max(3, nodeCount);
+        ropeType = RopeModelName;
         nodeMass = Mathf.Max(0.0001f, nodeMass);
         stiffness = Mathf.Max(1f, stiffness);
         springDamping = Mathf.Max(0f, springDamping);
@@ -117,6 +127,8 @@ public class MassSpringRope : MonoBehaviour
             return;
         }
 
+        SyncLengthToEndpoints();
+
         if (!initialized || nodes == null || nodes.Length != nodeCount)
         {
             Setup();
@@ -136,6 +148,7 @@ public class MassSpringRope : MonoBehaviour
             BlendTowardTautLine();
         }
 
+        UpdateStretchDebug();
         UpdateLineRenderer();
     }
 
@@ -154,8 +167,10 @@ public class MassSpringRope : MonoBehaviour
             return;
         }
 
+        SyncLengthToEndpoints();
         nodes = new SpringRopeNode[nodeCount];
         restLength = ropeLength / (nodeCount - 1);
+        previousNodeCount = nodeCount;
 
         Vector3 start = pivotPoint.position;
         Vector3 end = ropeAttachPoint.position;
@@ -172,6 +187,7 @@ public class MassSpringRope : MonoBehaviour
         }
 
         initialized = true;
+        UpdateStretchDebug();
         UpdateLineRenderer();
     }
 
@@ -237,11 +253,14 @@ public class MassSpringRope : MonoBehaviour
 
             float stretch = safeLength - restLength;
 
+            // Hooke's law between neighboring rope nodes:
+            // F = -k * (currentLength - restLength), applied along the spring axis.
             Vector3 springForce = stiffness * stretch * dir;
 
             Vector3 relativeVelocity = nodes[b].velocity - nodes[a].velocity;
             float velocityAlongSpring = Vector3.Dot(relativeVelocity, dir);
 
+            // Damping opposes relative motion along the same spring axis.
             Vector3 dampingForce = springDamping * velocityAlongSpring * dir;
 
             Vector3 totalForce = springForce + dampingForce;
@@ -367,7 +386,9 @@ public class MassSpringRope : MonoBehaviour
         }
 
         // مقدار الانحناء عند الزاوية الكبيرة
-        float maxSag = bendAmount;
+        float stiffnessFlex = Mathf.InverseLerp(6000f, 200f, stiffness);
+        float maxSag = bendAmount * Mathf.Lerp(0.35f, 1.65f, stiffnessFlex);
+        float lineBlend = Mathf.Lerp(0.92f, 0.55f, bendAmount) * Mathf.Lerp(1f, 0.7f, stiffnessFlex);
 
         for (int i = 1; i < last; i++)
         {
@@ -380,7 +401,8 @@ public class MassSpringRope : MonoBehaviour
 
             Vector3 sagOffset = bendDirection * maxSag * angleFactor * middleWeight;
 
-            nodes[i].position = straightPosition + sagOffset;
+            Vector3 targetPosition = straightPosition + sagOffset;
+            nodes[i].position = Vector3.Lerp(nodes[i].position, targetPosition, lineBlend);
 
             // نخفف السرعة حتى ما يرجع يهتز بعنف
             nodes[i].velocity *= 0.7f;
@@ -439,6 +461,32 @@ public class MassSpringRope : MonoBehaviour
         }
     }
 
+    private void UpdateStretchDebug()
+    {
+        if (nodes == null || nodes.Length < 2 || restLength <= 0f)
+        {
+            currentAverageStretch = 0f;
+            currentMaxStretch = 0f;
+            currentAverageStretchPercent = 0f;
+            return;
+        }
+
+        float totalStretch = 0f;
+        float maxStretch = 0f;
+        for (int i = 0; i < nodes.Length - 1; i++)
+        {
+            float length = Vector3.Distance(nodes[i].position, nodes[i + 1].position);
+            float stretch = Mathf.Abs(length - restLength);
+            totalStretch += stretch;
+            maxStretch = Mathf.Max(maxStretch, stretch);
+        }
+
+        int segmentCount = nodes.Length - 1;
+        currentAverageStretch = totalStretch / Mathf.Max(1, segmentCount);
+        currentMaxStretch = maxStretch;
+        currentAverageStretchPercent = currentAverageStretch / restLength * 100f;
+    }
+
     private void DrawEditorPreview()
     {
         if (!Ready())
@@ -463,5 +511,65 @@ public class MassSpringRope : MonoBehaviour
     {
         initialized = false;
         Setup();
+    }
+
+    public void SyncLengthToEndpoints()
+    {
+        if (!Ready())
+        {
+            return;
+        }
+
+        float endpointDistance = Vector3.Distance(pivotPoint.position, ropeAttachPoint.position);
+        if (float.IsFinite(endpointDistance) && endpointDistance > 0.001f)
+        {
+            ropeLength = endpointDistance;
+            restLength = ropeLength / Mathf.Max(1, nodeCount - 1);
+        }
+    }
+
+    public void SnapToCurrentEndpoints()
+    {
+        if (!Ready())
+        {
+            return;
+        }
+
+        SyncLengthToEndpoints();
+        if (!initialized || nodes == null || nodes.Length != nodeCount)
+        {
+            Setup();
+        }
+
+        Vector3 start = pivotPoint.position;
+        Vector3 end = ropeAttachPoint.position;
+        for (int i = 0; i < nodeCount; i++)
+        {
+            float t = (float)i / (nodeCount - 1);
+            nodes[i].position = Vector3.Lerp(start, end, t);
+            nodes[i].velocity = Vector3.zero;
+            nodes[i].force = Vector3.zero;
+        }
+
+        UpdateStretchDebug();
+        UpdateLineRenderer();
+    }
+
+    public void ApplyMassSpringSettings(int segments, float newStiffness, float newDamping, float newFlexibility, int constraintIterations)
+    {
+        int requestedNodeCount = Mathf.Max(3, segments + 1);
+        bool topologyChanged = requestedNodeCount != nodeCount || previousNodeCount != requestedNodeCount;
+
+        nodeCount = requestedNodeCount;
+        stiffness = Mathf.Max(1f, newStiffness);
+        springDamping = Mathf.Max(0f, newDamping);
+        bendAmount = Mathf.Clamp01(newFlexibility);
+        lengthCorrectionIterations = Mathf.Max(0, constraintIterations);
+        ropeType = RopeModelName;
+
+        if (topologyChanged || nodes == null || nodes.Length != nodeCount)
+        {
+            ResetRope();
+        }
     }
 }

@@ -12,6 +12,13 @@ public class Simulation3D : MonoBehaviour
         Ultra
     }
 
+    public enum LegacyParticleMode
+    {
+        Hidden,
+        Preview,
+        StressTest
+    }
+
     public event System.Action SimulationStepCompleted;
 
     [Header("Settings")]
@@ -28,10 +35,14 @@ public class Simulation3D : MonoBehaviour
 
     [Header("Particle Count Presets")]
     public bool showLegacyFluidParticles = false;
+    public LegacyParticleMode legacyParticleMode = LegacyParticleMode.Hidden;
     public ParticleCountPreset particlePreset = ParticleCountPreset.Low;
     public int currentParticleCount = 8000;
     public float estimatedGpuBufferMegabytes;
     public string particlePresetWarning = "";
+    public Color legacyPreviewColor = new Color(0.1f, 0.25f, 1f, 1f);
+    public bool legacyPreviewCanEmit = true;
+    public string LegacyPreviewState => legacyParticleMode.ToString();
 
     [Header("Paint Controls")]
     public float emissionRate = 120f;
@@ -43,6 +54,12 @@ public class Simulation3D : MonoBehaviour
     public Spawner3D spawner;
     public ParticleDisplay3D display;
     public Transform floorDisplay;
+
+    [Header("Legacy Preview Placement")]
+    public Vector3 previewPosition = new Vector3(6f, 2.2f, 0f);
+    public Vector3 previewScale = new Vector3(1.1f, 1.1f, 1.1f);
+    public Vector3 stressTestPosition = new Vector3(6f, 2.2f, 0f);
+    public Vector3 stressTestScale = new Vector3(2.4f, 2.4f, 2.4f);
 
     // Buffers
     public ComputeBuffer positionBuffer { get; private set; }
@@ -67,6 +84,9 @@ public class Simulation3D : MonoBehaviour
     bool pauseNextFrame;
     bool initialized;
     Spawner3D.SpawnData spawnData;
+    Vector3 originalPosition;
+    Vector3 originalScale;
+    bool hasOriginalTransform;
 
     const int lowParticleCount = 8000;
     const int mediumParticleCount = 50000;
@@ -90,7 +110,8 @@ public class Simulation3D : MonoBehaviour
             return;
         }
 
-        ApplyLegacyParticleVisibility();
+        CacheOriginalTransform();
+        ApplyLegacyParticleMode();
         ApplyParticlePreset(particlePreset);
     }
 
@@ -109,7 +130,7 @@ public class Simulation3D : MonoBehaviour
         holeDiameter = Mathf.Max(0.001f, holeDiameter);
         currentParticleCount = GetParticleCount(particlePreset);
         estimatedGpuBufferMegabytes = EstimateBufferMegabytes(currentParticleCount);
-        ApplyLegacyParticleVisibility();
+        ApplyLegacyParticleMode();
     }
 
     void FixedUpdate()
@@ -142,12 +163,12 @@ public class Simulation3D : MonoBehaviour
             floorDisplay.transform.localScale = new Vector3(1, 1 / safeYScale * 0.1f, 1);
         }
 
-        ApplyLegacyParticleVisibility();
+        ApplyLegacyParticleMode();
     }
 
     void RunSimulationFrame(float frameTime)
     {
-        if (!initialized || isPaused || iterationsPerFrame <= 0)
+        if (!initialized || isPaused || iterationsPerFrame <= 0 || !CanRunLegacyPreview())
         {
             return;
         }
@@ -245,7 +266,7 @@ public class Simulation3D : MonoBehaviour
         if (recreatedBuffers && display != null)
         {
             display.Init(this);
-            ApplyLegacyParticleVisibility();
+            ApplyLegacyParticleMode();
         }
     }
 
@@ -336,7 +357,7 @@ public class Simulation3D : MonoBehaviour
         if (display != null)
         {
             display.Init(this);
-            ApplyLegacyParticleVisibility();
+            ApplyLegacyParticleMode();
         }
 
         initialized = true;
@@ -374,17 +395,68 @@ public class Simulation3D : MonoBehaviour
 
     public void SetLegacyFluidParticlesVisible(bool visible)
     {
-        showLegacyFluidParticles = visible;
-        ApplyLegacyParticleVisibility();
+        SetLegacyParticleMode(visible ? LegacyParticleMode.Preview : LegacyParticleMode.Hidden);
     }
 
-    void ApplyLegacyParticleVisibility()
+    public void SetLegacyParticleMode(LegacyParticleMode mode)
     {
+        legacyParticleMode = mode;
+        showLegacyFluidParticles = mode != LegacyParticleMode.Hidden;
+        ApplyLegacyParticleMode();
+    }
+
+    public void ApplyLegacyPaintState(Color color, bool canEmit)
+    {
+        legacyPreviewColor = color;
+        legacyPreviewCanEmit = canEmit;
+        ApplyLegacyParticleMode();
+    }
+
+    void ApplyLegacyParticleMode()
+    {
+        CacheOriginalTransform();
+        bool visible = legacyParticleMode != LegacyParticleMode.Hidden && legacyPreviewCanEmit;
+        showLegacyFluidParticles = visible;
+
         if (display != null)
         {
-            display.showParticles = showLegacyFluidParticles;
-            display.enabled = showLegacyFluidParticles;
+            display.col = legacyPreviewColor;
+            display.showParticles = visible;
+            display.enabled = visible;
         }
+
+        if (legacyParticleMode == LegacyParticleMode.Preview)
+        {
+            transform.position = previewPosition;
+            transform.localScale = previewScale;
+        }
+        else if (legacyParticleMode == LegacyParticleMode.StressTest)
+        {
+            transform.position = stressTestPosition;
+            transform.localScale = stressTestScale;
+        }
+        else if (hasOriginalTransform)
+        {
+            transform.position = originalPosition;
+            transform.localScale = originalScale;
+        }
+    }
+
+    bool CanRunLegacyPreview()
+    {
+        return legacyParticleMode != LegacyParticleMode.Hidden && legacyPreviewCanEmit;
+    }
+
+    void CacheOriginalTransform()
+    {
+        if (hasOriginalTransform)
+        {
+            return;
+        }
+
+        originalPosition = transform.position;
+        originalScale = transform.localScale;
+        hasOriginalTransform = true;
     }
 
     void ApplyPaintSpawnerSettings()
